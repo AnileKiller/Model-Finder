@@ -78,9 +78,12 @@ dependencies {
     implementation(libs.tensorflow.lite)
     implementation(libs.tensorflow.lite.support)
 
-    // GPU delegate for hardware acceleration (NNAPI is bundled in the core runtime)
+    // GPU delegate for hardware acceleration (NNAPI is bundled in the core runtime).
+    // NOTE: only the legacy direct GpuDelegate/CompatibilityList API is used here —
+    // do NOT also add tensorflow-lite-gpu-delegate-plugin (Play Services variant),
+    // it ships a conflicting definition of GpuDelegateFactory.Options that breaks
+    // compilation ("Cannot access class ... conflicting dependencies").
     implementation(libs.tensorflow.lite.gpu)
-    implementation(libs.tensorflow.lite.gpu.delegate.plugin)
 
     // Image loading
     implementation(libs.coil.compose)
