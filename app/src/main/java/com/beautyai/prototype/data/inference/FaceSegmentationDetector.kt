@@ -16,12 +16,18 @@ import java.nio.channels.FileChannel
  * Wraps the XenoFormer face segmentation TFLite model.
  *
  * Model:  face_segmentation_xenoformer_xs_2024_04_02.int8.tflite
- * Input:  [1, H, W, 3]   — uint8 or float32 RGB depending on quantisation
+ * Input:  [1, H, W, 3]   — normalised float RGB in [0, 1]
  * Output: [1, H, W, 1]   — per-pixel probability that the pixel is skin/face
  *
- * The model is quantised (int8), so both input and output are uint8 buffers
- * that the support library auto-dequantises. We work at a fixed 256×256
- * resolution and then bilinearly scale the mask back to the source image.
+ * NOTE: despite the "int8" filename, this model is *weight-only* (dynamic
+ * range) quantised — only the weights are int8, while the actual input and
+ * output tensors are still float32. Feeding it raw int8 buffers causes
+ * TRANSPOSE_CONV to fail at interpreter-creation time with
+ * "weights->type != input->type (INT8 != FLOAT32)". We therefore use
+ * float32 buffers here, same as the other two models.
+ *
+ * We work at a fixed 256×256 resolution and then bilinearly scale the
+ * mask back to the source image.
  *
  * Returns a 2D float array [height][width] with values in [0, 1].
  */
@@ -32,13 +38,12 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
 
     private val inputSize = 256
 
-    // Int8 quantised model — use byte buffers for in/out
     private val inputBuffer: ByteBuffer =
-        ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3)
+        ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * FLOAT_BYTES)
             .also { it.order(ByteOrder.nativeOrder()) }
 
     private val outputBuffer: ByteBuffer =
-        ByteBuffer.allocateDirect(1 * inputSize * inputSize * 1)
+        ByteBuffer.allocateDirect(1 * inputSize * inputSize * 1 * FLOAT_BYTES)
             .also { it.order(ByteOrder.nativeOrder()) }
 
     init {
@@ -68,7 +73,7 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
         outputBuffer.rewind()
         interpreter.run(inputBuffer, outputBuffer)
 
-        // Dequantise and upsample mask back to original image dimensions
+        // Upsample mask back to original image dimensions
         return upsampleMask(outputBuffer, bitmap.width, bitmap.height)
     }
 
@@ -79,21 +84,20 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
         val pixels = IntArray(inputSize * inputSize)
         bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
         for (pixel in pixels) {
-            inputBuffer.put((pixel shr 16 and 0xFF).toByte()) // R
-            inputBuffer.put((pixel shr 8  and 0xFF).toByte()) // G
-            inputBuffer.put((pixel        and 0xFF).toByte()) // B
+            inputBuffer.putFloat((pixel shr 16 and 0xFF) / 255f) // R
+            inputBuffer.putFloat((pixel shr 8  and 0xFF) / 255f) // G
+            inputBuffer.putFloat((pixel        and 0xFF) / 255f) // B
         }
     }
 
     /**
      * Bilinear upsampling of the [inputSize]×[inputSize] mask to [targetW]×[targetH].
-     * Output quantisation [0,255] → [0,1] float.
      */
     private fun upsampleMask(raw: ByteBuffer, targetW: Int, targetH: Int): Array<FloatArray> {
         raw.rewind()
         val flatMask = FloatArray(inputSize * inputSize)
         for (i in flatMask.indices) {
-            flatMask[i] = (raw.get().toInt() and 0xFF) / 255f
+            flatMask[i] = raw.getFloat()
         }
 
         val result = Array(targetH) { FloatArray(targetW) }
@@ -129,6 +133,7 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
     companion object {
         private const val MODEL_FILE =
             "models/face_segmentation_xenoformer_xs_2024_04_02.int8.tflite"
+        private const val FLOAT_BYTES = 4
 
         private fun loadModelFile(context: Context, filename: String): MappedByteBuffer {
             val assetFd = context.assets.openFd(filename)
