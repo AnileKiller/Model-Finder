@@ -165,8 +165,8 @@ class BlazeFaceDetector(context: Context) : AutoCloseable {
             val anchors = mutableListOf<FloatArray>()
 
             for ((strideIdx, stride) in strides.withIndex()) {
-                val gridRows = Math.ceil(inputSize / stride).toInt()
-                val gridCols = Math.ceil(inputSize / stride).toInt()
+                val gridRows = kotlin.math.ceil(inputSize / stride).toInt()
+                val gridCols = kotlin.math.ceil(inputSize / stride).toInt()
                 val anchorsCount = anchorsPerStride[strideIdx]
 
                 for (y in 0 until gridRows) {
