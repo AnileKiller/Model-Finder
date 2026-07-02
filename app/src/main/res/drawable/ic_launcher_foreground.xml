@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple face/sparkle glyph representing beauty enhancement -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30 C68,30 79,41 79,55 C79,69 68,80 54,80 C40,80 29,69 29,55 C29,41 40,30 54,30 Z" />
+    <path
+        android:fillColor="#9C4068"
+        android:pathData="M44,50 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 Z" />
+    <path
+        android:fillColor="#9C4068"
+        android:pathData="M60,50 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 Z" />
+    <path
+        android:fillColor="#9C4068"
+        android:pathData="M42,64 C46,70 62,70 66,64 C62,72 46,72 42,64 Z" />
+    <path
+        android:fillColor="#FFD966"
+        android:pathData="M54,16 L56,22 L62,22 L57,26 L59,32 L54,28 L49,32 L51,26 L46,22 L52,22 Z" />
+</vector>
