@@ -1,0 +1,13 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# TFLite model files — restore from secrets in CI or place manually for local dev
+app/src/main/assets/models/*.tflite

@@ -1,0 +1,55 @@
+Create a simple Android app in Kotlin using Jetpack Compose to demonstrate AI facial beauty enhancement. The app is only a prototype for testing before integrating the feature into another project.
+
+Features
+
+- Select a photo from the gallery.
+- Display the original image and the enhanced image side by side.
+- Use on-device AI only (no cloud services).
+- Detect the face using "blaze_face_short_range.tflite".
+- Extract 468 facial landmarks using "facemesh_lite_468_2022_09_06.f16.tflite".
+- Generate a face mask using "face_segmentation_xenoformer_xs_2024_04_02.int8.tflite".
+
+Beauty Controls
+
+Provide real-time sliders for:
+
+- Skin smoothing
+- Skin brightness
+- Skin tone enhancement
+- Blemish reduction
+- Under-eye reduction
+- Eye brightness
+- Teeth whitening
+- Face sharpening
+- Overall beauty intensity
+
+Include a toggle to compare Original ↔ Enhanced.
+
+UI
+
+- Modern Material 3 design.
+- One main screen with:
+  - Select Image button
+  - Original image preview
+  - Enhanced image preview
+  - Beauty sliders
+  - Reset button
+  - Save Image button
+
+Technical Requirements
+
+- Kotlin
+- Jetpack Compose
+- TensorFlow Lite
+- MediaPipe Tasks (or direct TFLite inference)
+- MVVM architecture
+- Coroutines
+- Hardware acceleration (GPU/NNAPI when available, CPU fallback)
+- Process images completely offline.
+- Preserve the original image resolution when saving.
+
+Code Quality
+
+- Organize the project into data, domain, and presentation layers.
+- Write clean, well-documented, production-quality code.
+- Make the beauty pipeline modular so it can later be copied into another Android application with minimal changes.

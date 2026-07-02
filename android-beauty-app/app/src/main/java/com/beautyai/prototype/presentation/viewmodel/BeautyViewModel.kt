@@ -1,0 +1,166 @@
+package com.beautyai.prototype.presentation.viewmodel
+
+import android.app.Application
+import android.net.Uri
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.beautyai.prototype.data.repository.FaceAnalysisRepository
+import com.beautyai.prototype.data.repository.ImageRepository
+import com.beautyai.prototype.domain.model.BeautyParameters
+import com.beautyai.prototype.domain.model.FaceData
+import com.beautyai.prototype.domain.model.ProcessingState
+import com.beautyai.prototype.domain.usecase.AnalyseFaceUseCase
+import com.beautyai.prototype.domain.usecase.ApplyBeautyUseCase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * MVVM ViewModel for the beauty-enhancement screen.
+ *
+ * Responsibilities:
+ *  - Expose [processingState] and [beautyParams] as [StateFlow]s to the UI.
+ *  - Orchestrate the three-stage pipeline (face detection → enhancement).
+ *  - Debounce slider updates so the pipeline doesn't saturate the CPU.
+ *  - Delegate all heavy work to [Dispatchers.Default].
+ */
+class BeautyViewModel(application: Application) : AndroidViewModel(application) {
+
+    // ── Repositories & use-cases ─────────────────────────────────────────────
+
+    private val imageRepo      = ImageRepository(application)
+    private val faceRepo       = FaceAnalysisRepository(application)
+    private val analyseFace    = AnalyseFaceUseCase(faceRepo)
+    private val applyBeauty    = ApplyBeautyUseCase()
+
+    // ── UI state ─────────────────────────────────────────────────────────────
+
+    private val _processingState = MutableStateFlow<ProcessingState>(ProcessingState.Idle)
+    val processingState: StateFlow<ProcessingState> = _processingState.asStateFlow()
+
+    private val _beautyParams = MutableStateFlow(BeautyParameters.DEFAULT)
+    val beautyParams: StateFlow<BeautyParameters> = _beautyParams.asStateFlow()
+
+    /** True while an enhanced image is being applied after a slider change. */
+    private val _isReprocessing = MutableStateFlow(false)
+    val isReprocessing: StateFlow<Boolean> = _isReprocessing.asStateFlow()
+
+    private val _showOriginal = MutableStateFlow(false)
+    val showOriginal: StateFlow<Boolean> = _showOriginal.asStateFlow()
+
+    private val _saveSuccess = MutableStateFlow<String?>(null)
+    val saveSuccess: StateFlow<String?> = _saveSuccess.asStateFlow()
+
+    // ── Cached analysis results ──────────────────────────────────────────────
+
+    /** Holds the last successfully analysed face so slider tweaks don't re-run inference. */
+    private var cachedFaceData: FaceData? = null
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /**
+     * Load an image from [uri], run the full AI pipeline, and publish the result.
+     */
+    fun loadImage(uri: Uri) {
+        viewModelScope.launch {
+            _processingState.value = ProcessingState.Processing(0f, "Loading image…")
+            cachedFaceData = null
+
+            runCatching {
+                val bitmap = imageRepo.loadBitmap(uri)
+
+                _processingState.value = ProcessingState.Processing(0.05f, "Analysing face…")
+
+                val faceData = analyseFace(bitmap) { progress, msg ->
+                    _processingState.value = ProcessingState.Processing(
+                        progress = 0.05f + progress * 0.7f,
+                        message  = msg
+                    )
+                }
+
+                _processingState.value = ProcessingState.Processing(0.85f, "Applying beauty…")
+                cachedFaceData = faceData
+
+                val enhanced = withContext(Dispatchers.Default) {
+                    if (faceData != null) {
+                        applyBeauty(bitmap, faceData, _beautyParams.value)
+                    } else {
+                        bitmap
+                    }
+                }
+
+                _processingState.value = ProcessingState.Success(
+                    original = bitmap,
+                    enhanced = enhanced,
+                    faceData = faceData
+                )
+            }.onFailure { e ->
+                _processingState.value = ProcessingState.Error(
+                    e.localizedMessage ?: "Unknown error"
+                )
+            }
+        }
+    }
+
+    /**
+     * Called whenever a slider is moved. Re-applies the beauty pipeline to the
+     * cached original bitmap without re-running face inference.
+     */
+    fun updateParams(params: BeautyParameters) {
+        _beautyParams.value = params
+        val current = _processingState.value
+        if (current !is ProcessingState.Success) return
+
+        viewModelScope.launch {
+            _isReprocessing.value = true
+            runCatching {
+                val enhanced = withContext(Dispatchers.Default) {
+                    val faceData = cachedFaceData
+                    if (faceData != null) {
+                        applyBeauty(current.original, faceData, params)
+                    } else {
+                        current.original
+                    }
+                }
+                _processingState.value = current.copy(enhanced = enhanced)
+            }
+            _isReprocessing.value = false
+        }
+    }
+
+    /** Reset all sliders to their default values and re-apply. */
+    fun resetParams() {
+        updateParams(BeautyParameters.DEFAULT)
+    }
+
+    /** Toggle between showing the original and the enhanced image. */
+    fun toggleOriginal() {
+        _showOriginal.update { !it }
+    }
+
+    /** Save the currently enhanced image to the gallery. */
+    fun saveImage() {
+        val current = _processingState.value as? ProcessingState.Success ?: return
+        viewModelScope.launch {
+            runCatching {
+                val uri = imageRepo.saveBitmap(current.enhanced)
+                _saveSuccess.value = "Image saved to gallery"
+            }.onFailure { e ->
+                _saveSuccess.value = "Save failed: ${e.localizedMessage}"
+            }
+        }
+    }
+
+    fun clearSaveMessage() {
+        _saveSuccess.value = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        faceRepo.close()
+    }
+}
