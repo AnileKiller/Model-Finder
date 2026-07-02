@@ -20,7 +20,7 @@ import java.nio.channels.FileChannel
  * Input:  [1, 192, 192, 3] — normalised float RGB in [0, 1]
  * Output:
  *   - landmarks  [1, 1, 1, 1404]  (468 × 3 values: x, y, z in [0, 192])
- *   - score      [1, 1]           (face presence confidence)
+ *   - score      [1, 1, 1, 1]     (face presence confidence)
  *
  * Landmarks are returned in normalised [0,1] image coordinates.
  */
@@ -36,7 +36,8 @@ class FaceMeshDetector(context: Context) : AutoCloseable {
 
     // Flat output: 468 landmarks × (x, y, z)
     private val landmarksOut = Array(1) { Array(1) { Array(1) { FloatArray(468 * 3) } } }
-    private val scoreOut     = Array(1) { FloatArray(1) }
+    // Shape: [1, 1, 1, 1]  (face presence confidence)
+    private val scoreOut     = Array(1) { Array(1) { Array(1) { FloatArray(1) } } }
 
     init {
         val modelBuffer = loadModelFile(context, MODEL_FILE)
@@ -71,7 +72,7 @@ class FaceMeshDetector(context: Context) : AutoCloseable {
         )
         interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
 
-        val presenceScore = sigmoid(scoreOut[0][0])
+        val presenceScore = sigmoid(scoreOut[0][0][0][0])
         if (presenceScore < presenceThreshold) return null
 
         // Denormalise from [0, 192] crop-space back to original image space
