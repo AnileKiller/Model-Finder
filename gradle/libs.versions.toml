@@ -9,6 +9,7 @@ coroutines = "1.9.0"
 tensorflow-lite = "2.16.1"
 tensorflow-lite-support = "0.4.4"
 tensorflow-lite-gpu = "2.16.1"
+tensorflow-lite-gpu-api = "2.16.1"
 coil = "2.7.0"
 
 [libraries]
