@@ -23,46 +23,8 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      # ── Restore TFLite models from GitHub Secrets ────────────────────────
-      # Each model is stored as a Base64-encoded secret.
-      # Run: base64 -w 0 <model_file.tflite> and paste the output as a secret.
-      #
-      # Required secrets:
-      #   BLAZE_FACE_MODEL       — blaze_face_short_range.tflite
-      #   FACE_MESH_MODEL        — facemesh_lite_468_2022_09_06.f16.tflite
-      #   FACE_SEGMENTATION_MODEL— face_segmentation_xenoformer_xs_2024_04_02.int8.tflite
-
-      - name: Restore TFLite models from secrets
-        env:
-          BLAZE_FACE_MODEL: ${{ secrets.BLAZE_FACE_MODEL }}
-          FACE_MESH_MODEL: ${{ secrets.FACE_MESH_MODEL }}
-          FACE_SEGMENTATION_MODEL: ${{ secrets.FACE_SEGMENTATION_MODEL }}
-        run: |
-          mkdir -p app/src/main/assets/models
-
-          if [ -n "$BLAZE_FACE_MODEL" ]; then
-            echo "$BLAZE_FACE_MODEL" | base64 --decode \
-              > app/src/main/assets/models/blaze_face_short_range.tflite
-            echo "BlazeFace model restored ($(wc -c < app/src/main/assets/models/blaze_face_short_range.tflite) bytes)"
-          else
-            echo "⚠️  BLAZE_FACE_MODEL secret not set — build will succeed but app won't run without the model file."
-          fi
-
-          if [ -n "$FACE_MESH_MODEL" ]; then
-            echo "$FACE_MESH_MODEL" | base64 --decode \
-              > "app/src/main/assets/models/facemesh_lite_468_2022_09_06.f16.tflite"
-            echo "FaceMesh model restored"
-          else
-            echo "⚠️  FACE_MESH_MODEL secret not set."
-          fi
-
-          if [ -n "$FACE_SEGMENTATION_MODEL" ]; then
-            echo "$FACE_SEGMENTATION_MODEL" | base64 --decode \
-              > "app/src/main/assets/models/face_segmentation_xenoformer_xs_2024_04_02.int8.tflite"
-            echo "Segmentation model restored"
-          else
-            echo "⚠️  FACE_SEGMENTATION_MODEL secret not set."
-          fi
+      # TFLite models are committed to the repo under
+      # app/src/main/assets/models/ — no secrets or restore step needed.
 
       # ── Generate gradle-wrapper.jar ─────────────────────────────────────
       # The binary jar is not committed to the repo. Install Gradle CLI and
@@ -106,20 +68,6 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Restore TFLite models from secrets
-        env:
-          BLAZE_FACE_MODEL: ${{ secrets.BLAZE_FACE_MODEL }}
-          FACE_MESH_MODEL: ${{ secrets.FACE_MESH_MODEL }}
-          FACE_SEGMENTATION_MODEL: ${{ secrets.FACE_SEGMENTATION_MODEL }}
-        run: |
-          mkdir -p app/src/main/assets/models
-          [ -n "$BLAZE_FACE_MODEL" ] && echo "$BLAZE_FACE_MODEL" | base64 --decode \
-            > app/src/main/assets/models/blaze_face_short_range.tflite
-          [ -n "$FACE_MESH_MODEL" ] && echo "$FACE_MESH_MODEL" | base64 --decode \
-            > "app/src/main/assets/models/facemesh_lite_468_2022_09_06.f16.tflite"
-          [ -n "$FACE_SEGMENTATION_MODEL" ] && echo "$FACE_SEGMENTATION_MODEL" | base64 --decode \
-            > "app/src/main/assets/models/face_segmentation_xenoformer_xs_2024_04_02.int8.tflite"
-
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -155,3 +103,4 @@ jobs:
           name: app-release
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
+          
