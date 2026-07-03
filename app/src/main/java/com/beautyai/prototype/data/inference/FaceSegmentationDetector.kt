@@ -153,27 +153,3 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
         }
     }
 }
-        }
-        return result
-    }
-
-    override fun close() {
-        interpreter.close()
-        gpuDelegate?.close()
-    }
-
-    companion object {
-        private const val MODEL_FILE =
-            "models/face_segmentation_xenoformer_xs_2024_04_02.int8.tflite"
-        private const val FLOAT_BYTES = 4
-
-        private fun loadModelFile(context: Context, filename: String): MappedByteBuffer {
-            val assetFd = context.assets.openFd(filename)
-            return FileInputStream(assetFd.fileDescriptor).channel.map(
-                FileChannel.MapMode.READ_ONLY,
-                assetFd.startOffset,
-                assetFd.declaredLength
-            )
-        }
-    }
-}
