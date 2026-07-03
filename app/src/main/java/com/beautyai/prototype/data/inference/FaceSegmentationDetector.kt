@@ -13,21 +13,27 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 
 /**
- * Wraps the XenoFormer face segmentation TFLite model.
+ * Wraps Google's publicly released MediaPipe "Selfie Multiclass" segmentation
+ * model (part of the MediaPipe Image Segmenter task).
  *
- * Model:  face_segmentation_xenoformer_xs_2024_04_02.int8.tflite
- * Input:  [1, H, W, 3]   — normalised float RGB in [0, 1]
- * Output: [1, H, W, 1]   — per-pixel probability that the pixel is skin/face
+ * Model:  selfie_multiclass_256x256.tflite
+ *   https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite
  *
- * NOTE: despite the "int8" filename, this model is *weight-only* (dynamic
- * range) quantised — only the weights are int8, while the actual input and
- * output tensors are still float32. Feeding it raw int8 buffers causes
- * TRANSPOSE_CONV to fail at interpreter-creation time with
- * "weights->type != input->type (INT8 != FLOAT32)". We therefore use
- * float32 buffers here, same as the other two models.
+ * Input:  [1, 256, 256, 3] — float32 RGB normalised to [0, 1]
+ * Output: [1, 256, 256, 6] — float32 per-pixel per-class confidence, classes:
+ *   0 = background, 1 = hair, 2 = body-skin, 3 = face-skin, 4 = clothes, 5 = other
  *
- * We work at a fixed 256×256 resolution and then bilinearly scale the
- * mask back to the source image.
+ * This replaces the previously used "XenoFormer" model, which was extracted
+ * from the Snapseed app and targeted an unreleased/internal TFLite runtime
+ * (2.21.0). That model's hybrid INT8/FLOAT32 TRANSPOSE_CONV op could not be
+ * validated by any publicly available TFLite SDK version and crashed at
+ * interpreter creation regardless of buffer type, XNNPACK setting, or runtime
+ * version. This model is fully public, float32 throughout, and designed to
+ * run on the standard TFLite Android runtime.
+ *
+ * We extract the "face-skin" channel (index 3) as the beauty-retouch mask,
+ * work at a fixed 256x256 resolution, then bilinearly scale it back up to
+ * the source image size.
  *
  * Returns a 2D float array [height][width] with values in [0, 1].
  */
@@ -43,37 +49,30 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
             .also { it.order(ByteOrder.nativeOrder()) }
 
     private val outputBuffer: ByteBuffer =
-        ByteBuffer.allocateDirect(1 * inputSize * inputSize * 1 * FLOAT_BYTES)
+        ByteBuffer.allocateDirect(1 * inputSize * inputSize * NUM_CLASSES * FLOAT_BYTES)
             .also { it.order(ByteOrder.nativeOrder()) }
 
     init {
         val modelBuffer = loadModelFile(context, MODEL_FILE)
         val compatList = CompatibilityList()
 
-        // GPU delegate does not support int8 on all devices — fall back to CPU.
-        //
-        // XNNPACK (auto-enabled by default for CPU inference) does not support
-        // this model's internal "hybrid" dynamic-range-quantized TRANSPOSE_CONV
-        // node (int8 weights + float32 activations) and fails at interpreter
-        // creation with "weights->type != input->type (INT8 != FLOAT32)".
-        // The default (non-XNNPACK) TFLite CPU kernel supports hybrid ops fine,
-        // so XNNPACK must be explicitly disabled here.
         val options = Interpreter.Options().apply {
             gpuDelegate = null
             setNumThreads(4)
             setUseNNAPI(true)
-            setUseXNNPACK(false)
         }
         interpreter = Interpreter(modelBuffer, options)
     }
 
     /**
-     * Runs segmentation on the face region of [bitmap] defined by [faceBox].
+     * Runs segmentation on [bitmap]. [faceBox] is currently unused (the model
+     * segments the whole frame) but kept for API compatibility with callers
+     * and potential future face-region cropping.
+     *
      * Returns a 2D array sized [bitmap.height][bitmap.width] with per-pixel
-     * skin probability in [0, 1].
+     * face-skin probability in [0, 1].
      */
     fun segment(bitmap: Bitmap, faceBox: RectF): Array<FloatArray> {
-        // Work on the full image but mask outside the face box later
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         fillInputBuffer(scaled)
 
@@ -81,7 +80,6 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
         outputBuffer.rewind()
         interpreter.run(inputBuffer, outputBuffer)
 
-        // Upsample mask back to original image dimensions
         return upsampleMask(outputBuffer, bitmap.width, bitmap.height)
     }
 
@@ -99,13 +97,19 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
     }
 
     /**
-     * Bilinear upsampling of the [inputSize]×[inputSize] mask to [targetW]×[targetH].
+     * Extracts the face-skin channel ([FACE_SKIN_CLASS_INDEX]) from the
+     * multi-class output and bilinearly upsamples it to [targetW]×[targetH].
      */
     private fun upsampleMask(raw: ByteBuffer, targetW: Int, targetH: Int): Array<FloatArray> {
         raw.rewind()
         val flatMask = FloatArray(inputSize * inputSize)
-        for (i in flatMask.indices) {
-            flatMask[i] = raw.getFloat()
+        for (i in 0 until inputSize * inputSize) {
+            var faceSkinScore = 0f
+            for (c in 0 until NUM_CLASSES) {
+                val value = raw.getFloat()
+                if (c == FACE_SKIN_CLASS_INDEX) faceSkinScore = value
+            }
+            flatMask[i] = faceSkinScore
         }
 
         val result = Array(targetH) { FloatArray(targetW) }
@@ -139,9 +143,13 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
     }
 
     companion object {
-        private const val MODEL_FILE =
-            "models/face_segmentation_xenoformer_xs_2024_04_02.int8.tflite"
+        private const val MODEL_FILE = "models/selfie_multiclass_256x256.tflite"
         private const val FLOAT_BYTES = 4
+        private const val NUM_CLASSES = 6
+
+        // MediaPipe selfie_multiclass_256x256 class indices:
+        // 0 = background, 1 = hair, 2 = body-skin, 3 = face-skin, 4 = clothes, 5 = other
+        private const val FACE_SKIN_CLASS_INDEX = 3
 
         private fun loadModelFile(context: Context, filename: String): MappedByteBuffer {
             val assetFd = context.assets.openFd(filename)
