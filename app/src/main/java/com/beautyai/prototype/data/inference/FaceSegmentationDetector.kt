@@ -50,11 +50,19 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
         val modelBuffer = loadModelFile(context, MODEL_FILE)
         val compatList = CompatibilityList()
 
-        // GPU delegate does not support int8 on all devices — fall back to CPU
+        // GPU delegate does not support int8 on all devices — fall back to CPU.
+        //
+        // XNNPACK (auto-enabled by default for CPU inference) does not support
+        // this model's internal "hybrid" dynamic-range-quantized TRANSPOSE_CONV
+        // node (int8 weights + float32 activations) and fails at interpreter
+        // creation with "weights->type != input->type (INT8 != FLOAT32)".
+        // The default (non-XNNPACK) TFLite CPU kernel supports hybrid ops fine,
+        // so XNNPACK must be explicitly disabled here.
         val options = Interpreter.Options().apply {
             gpuDelegate = null
             setNumThreads(4)
             setUseNNAPI(true)
+            setUseXNNPACK(false)
         }
         interpreter = Interpreter(modelBuffer, options)
     }
@@ -121,6 +129,30 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
                     flatMask[y1 * inputSize + x0] * (1 - dx) * dy       +
                     flatMask[y1 * inputSize + x1] * dx       * dy
             }
+        }
+        return result
+    }
+
+    override fun close() {
+        interpreter.close()
+        gpuDelegate?.close()
+    }
+
+    companion object {
+        private const val MODEL_FILE =
+            "models/face_segmentation_xenoformer_xs_2024_04_02.int8.tflite"
+        private const val FLOAT_BYTES = 4
+
+        private fun loadModelFile(context: Context, filename: String): MappedByteBuffer {
+            val assetFd = context.assets.openFd(filename)
+            return FileInputStream(assetFd.fileDescriptor).channel.map(
+                FileChannel.MapMode.READ_ONLY,
+                assetFd.startOffset,
+                assetFd.declaredLength
+            )
+        }
+    }
+}
         }
         return result
     }
