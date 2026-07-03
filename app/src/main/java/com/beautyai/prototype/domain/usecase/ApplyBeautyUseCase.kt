@@ -224,29 +224,57 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    private fun applyUnderEyeReduction(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+        private fun applyUnderEyeReduction(src: Bitmap, face: FaceData, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val pixels = IntArray(w * h)
         result.getPixels(pixels, 0, w, 0, 0, w, h)
 
         listOf(face.leftEyeRect(w, h), face.rightEyeRect(w, h)).forEach { eyeRect ->
+            // 1. Expand the box to properly cover the inner tear trough and lower orbital bone
             val underRect = RectF(
-                eyeRect.left, eyeRect.bottom,
-                eyeRect.right, eyeRect.bottom + eyeRect.height() * 0.7f
+                eyeRect.left - eyeRect.width() * 0.15f, 
+                eyeRect.bottom - eyeRect.height() * 0.1f, // Overlap slightly to catch lashline shadows
+                eyeRect.right + eyeRect.width() * 0.15f, 
+                eyeRect.bottom + eyeRect.height() * 0.9f
             )
-            val liftAmount = (strength * 60f).toInt().coerceIn(0, 255)
-            for (y in underRect.top.toInt() until underRect.bottom.toInt().coerceAtMost(h)) {
-                for (x in underRect.left.toInt() until underRect.right.toInt().coerceAtMost(w)) {
+            
+            // Lowered the global max lift slightly so it doesn't wash out
+            val liftAmount = (strength * 45f).toInt().coerceIn(0, 255)
+
+            for (y in underRect.top.toInt().coerceAtLeast(0) until underRect.bottom.toInt().coerceAtMost(h - 1)) {
+                for (x in underRect.left.toInt().coerceAtLeast(0) until underRect.right.toInt().coerceAtMost(w - 1)) {
                     val idx = y * w + x
                     val p = pixels[idx]
+                    
+                    val luminance = luma(p)
+                    
+                    // 2. LUMINANCE GATING: Target ONLY the dark shadows.
+                    // If luminance < 70 (dark shadow), shadowLikeness is 1.0 (Full effect).
+                    // If luminance > 140 (bright cheekbone), shadowLikeness is 0.0 (No effect).
+                    val shadowLikeness = 1f - smoothstep(70f, 140f, luminance)
+                    
+                    // Skip pixels that are already bright to prevent the white "stroke" effect
+                    if (shadowLikeness <= 0f) continue 
+                    
                     val a = p ushr 24
-                    val r = screen(p shr 16 and 0xFF, liftAmount)
+                    
+                    // 3. COLOR CORRECTION: Eye bags are usually blue/purple. 
+                    // Pushing a pure screen blend makes them ashy/gray. 
+                    // We lift Red slightly more than Blue to warm the shadow up and match natural skin.
+                    val rLift = (liftAmount * 1.15f).toInt().coerceIn(0, 255)
+                    val bLift = (liftAmount * 0.85f).toInt().coerceIn(0, 255)
+                    
+                    val r = screen(p shr 16 and 0xFF, rLift)
                     val g = screen(p shr 8  and 0xFF, liftAmount)
-                    val b = screen(p        and 0xFF, liftAmount)
+                    val b = screen(p        and 0xFF, bLift)
+                    
                     val feather = ellipseFeather(underRect, x, y)
-                    pixels[idx] = blendPixel(p, (a shl 24) or (r shl 16) or (g shl 8) or b,
-                        strength * feather)
+                    
+                    // Combine user strength, geometric feathering, and shadow targeting
+                    val finalAlpha = strength * feather * shadowLikeness
+                    
+                    pixels[idx] = blendPixel(p, (a shl 24) or (r shl 16) or (g shl 8) or b, finalAlpha)
                 }
             }
         }
