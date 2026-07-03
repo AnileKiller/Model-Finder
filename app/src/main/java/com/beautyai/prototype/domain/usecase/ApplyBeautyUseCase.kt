@@ -6,27 +6,6 @@ import com.beautyai.prototype.domain.model.BeautyParameters
 import com.beautyai.prototype.domain.model.FaceData
 import kotlin.math.sqrt
 
-/**
- * Applies the full beauty-enhancement pipeline to [source] using the pre-computed
- * [faceData] and user-controlled [params].
- *
- * Processing runs on whatever coroutine dispatcher the caller provides
- * (use [Dispatchers.Default] for background work).
- *
- * ## Key fixes vs. v1
- * 1. Skin smoothing now uses a bilateral filter (edge-preserving) instead of
- *    Gaussian blur, so eyes/lips/nose outline survive even at max strength.
- *    After smoothing, ~25 % of the original high-frequency detail is blended
- *    back in so skin retains micro-texture rather than looking plastic.
- * 2. Skin brightness works in HSL space and only raises Lightness, preserving
- *    warm hue and saturation.  Max lift is capped so highlights don't blow out.
- * 3. Eye brightness is now luminance-gated (same trick as teeth whitening) so
- *    it only brightens the whites/iris, not eyelids or surrounding skin.
- * 4. Face sharpening amount is capped and only applied to high-confidence skin
- *    pixels to avoid halos at mask boundaries.
- * 5. Pipeline order: sharpen first (on the unmodified original detail), then
- *    smooth — so sharpening doesn't amplify artefacts from other effects.
- */
 class ApplyBeautyUseCase {
 
     operator fun invoke(
@@ -37,21 +16,25 @@ class ApplyBeautyUseCase {
         val effective = params.withGlobalIntensity()
         var result = source.copy(Bitmap.Config.ARGB_8888, true)
 
+        // 1. NEW: Pre-blur the segmentation mask to eliminate the "Phantom Mask" hard edges.
+        // A radius of 8-12 pixels creates a smooth gradient falloff at the borders.
+        val blurredMask = preBlurMask(faceData.segmentationMask, source.width, source.height, 12)
+
         // Sharpening first — works on original, unmodified detail
         if (effective.faceSharpening > 0f)
-            result = applyFaceSharpening(result, faceData, effective.faceSharpening)
+            result = applyFaceSharpening(result, faceData, blurredMask, effective.faceSharpening)
 
         if (effective.skinSmoothing > 0f)
-            result = applySkinSmoothing(result, faceData, effective.skinSmoothing)
+            result = applySkinSmoothing(result, blurredMask, effective.skinSmoothing)
 
         if (effective.blemishReduction > 0f)
-            result = applyBlemishReduction(result, faceData, effective.blemishReduction)
+            result = applyBlemishReduction(result, blurredMask, effective.blemishReduction)
 
         if (effective.skinBrightness > 0f)
-            result = applySkinBrightness(result, faceData, effective.skinBrightness)
+            result = applySkinBrightness(result, blurredMask, effective.skinBrightness)
 
         if (effective.skinToneEnhancement > 0f)
-            result = applySkinTone(result, faceData, effective.skinToneEnhancement)
+            result = applySkinTone(result, blurredMask, effective.skinToneEnhancement)
 
         if (effective.underEyeReduction > 0f)
             result = applyUnderEyeReduction(result, faceData, effective.underEyeReduction)
@@ -67,29 +50,12 @@ class ApplyBeautyUseCase {
 
     // ── Individual beauty effects ────────────────────────────────────────────
 
-    /**
-     * Bilateral-filter skin smoothing — edge-preserving.
-     *
-     * For each skin pixel the filter averages neighbours weighted by BOTH
-     * spatial proximity (Gaussian kernel) AND colour similarity (range
-     * Gaussian).  Pixels that differ significantly in colour from the centre
-     * contribute very little, so sharp edges (eye outline, lip border, nose)
-     * survive even at max [strength].
-     *
-     * After the bilateral pass, ~[TEXTURE_PRESERVE_AMOUNT] of the original
-     * high-frequency detail (original − blurred) is composited back in, so
-     * skin retains pore-level micro-texture rather than looking like plastic.
-     *
-     * The spatial radius scales with [strength]: 1 px at 0.08 → 6 px at 1.0.
-     * The colour sigma is fixed; lowering it makes the filter more edge-aware.
-     */
-    private fun applySkinSmoothing(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    private fun applySkinSmoothing(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
         val radius = (strength * MAX_BILATERAL_RADIUS).toInt().coerceAtLeast(1)
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // Build precomputed spatial Gaussian weights for the kernel
         val spatialWeights = FloatArray((radius + 1) * (radius + 1))
         for (dy in 0..radius) for (dx in 0..radius) {
             val dist2 = (dx * dx + dy * dy).toFloat()
@@ -101,7 +67,7 @@ class ApplyBeautyUseCase {
 
         for (y in 0 until h) {
             for (x in 0 until w) {
-                val maskVal = face.segmentationMask[y][x]
+                val maskVal = mask[y][x] // Using the blurred mask
                 if (maskVal < MASK_THRESHOLD) {
                     bilateral[y * w + x] = pixels[y * w + x]
                     continue
@@ -153,21 +119,19 @@ class ApplyBeautyUseCase {
             }
         }
 
-        // Blend back high-frequency detail to preserve skin texture
         val out = IntArray(w * h)
         for (i in pixels.indices) {
             val maskY = i / w; val maskX = i % w
-            val maskVal = face.segmentationMask.getOrNull(maskY)?.getOrNull(maskX) ?: 0f
+            val maskVal = mask.getOrNull(maskY)?.getOrNull(maskX) ?: 0f
             if (maskVal < MASK_THRESHOLD) { out[i] = bilateral[i]; continue }
 
-            // HF detail = original − bilateral result
             val orig = pixels[i]; val bil = bilateral[i]
             val a = orig ushr 24
             val detailR = ((orig shr 16 and 0xFF) - (bil shr 16 and 0xFF))
             val detailG = ((orig shr 8  and 0xFF) - (bil shr 8  and 0xFF))
             val detailB = ((orig        and 0xFF) - (bil        and 0xFF))
 
-            val textureStr = TEXTURE_PRESERVE_AMOUNT * strength  // less texture at low strength
+            val textureStr = TEXTURE_PRESERVE_AMOUNT * strength 
             val r = ((bil shr 16 and 0xFF) + detailR * textureStr).toInt().coerceIn(0, 255)
             val g = ((bil shr 8  and 0xFF) + detailG * textureStr).toInt().coerceIn(0, 255)
             val b = ((bil        and 0xFF) + detailB * textureStr).toInt().coerceIn(0, 255)
@@ -179,23 +143,15 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /**
-     * Skin brightness in HSL space — only Lightness is raised.
-     *
-     * Working in HSL means the warm hue and saturation of skin are untouched;
-     * the image looks brighter without going pale/grey.  Max lift is capped at
-     * [MAX_LIGHTNESS_LIFT] (0–1) so highlights don't blow out even at
-     * strength = 1.0.
-     */
-    private fun applySkinBrightness(src: Bitmap, face: FaceData, strength: Float): Bitmap {
-        val liftFraction = strength * MAX_LIGHTNESS_LIFT   // e.g. 0.12 at max
+    private fun applySkinBrightness(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
+        val liftFraction = strength * MAX_LIGHTNESS_LIFT 
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
-                val maskVal = face.segmentationMask[y][x]
+                val maskVal = mask[y][x]
                 if (maskVal < MASK_THRESHOLD) continue
                 val idx = y * w + x
                 val p = pixels[idx]
@@ -204,9 +160,7 @@ class ApplyBeautyUseCase {
                 val g = p shr 8  and 0xFF
                 val b = p        and 0xFF
 
-                // RGB → HSL
                 val hsl = rgbToHsl(r, g, b)
-                // Only lift L, clamp so we never exceed 1.0
                 hsl[2] = (hsl[2] + liftFraction).coerceIn(0f, 1f)
                 val rgb = hslToRgb(hsl[0], hsl[1], hsl[2])
 
@@ -219,21 +173,17 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /**
-     * Skin tone: unchanged from v1 — additive R/B nudge is fine.
-     * Only tightened the max offsets slightly so it doesn't compound with the
-     * HSL brightness change into an orange cast.
-     */
-    private fun applySkinTone(src: Bitmap, face: FaceData, strength: Float): Bitmap {
-        val rOffset = (strength * 12f).toInt()   // was 18
-        val bOffset = (strength * 10f).toInt()   // was 14
+    private fun applySkinTone(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
+        // 2. MODIFIED: Cut tone offsets in half to stop the "fake tan/muddy" look
+        val rOffset = (strength * 6f).toInt()   
+        val bOffset = (strength * 5f).toInt()   
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
-                val maskVal = face.segmentationMask[y][x]
+                val maskVal = mask[y][x]
                 if (maskVal < MASK_THRESHOLD) continue
                 val idx = y * w + x
                 val p = pixels[idx]
@@ -250,8 +200,7 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /** Blemish reduction: unchanged from v1 — logic is sound. */
-    private fun applyBlemishReduction(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    private fun applyBlemishReduction(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
@@ -259,7 +208,7 @@ class ApplyBeautyUseCase {
 
         for (y in 0 until h) {
             for (x in 0 until w) {
-                val maskVal = face.segmentationMask[y][x]
+                val maskVal = mask[y][x]
                 if (maskVal < MASK_THRESHOLD) continue
                 val idx = y * w + x
                 val p = pixels[idx]
@@ -275,7 +224,6 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /** Under-eye reduction: unchanged from v1 — ellipse feather is correct. */
     private fun applyUnderEyeReduction(src: Bitmap, face: FaceData, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
@@ -306,14 +254,6 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /**
-     * Eye brightness — now luminance-gated like teeth whitening.
-     *
-     * v1 brightened the entire eye bounding rect including eyelids and skin
-     * above the eye.  Now only pixels that are already relatively bright
-     * (whites of the eye, iris highlights) receive the lift, which is also
-     * capped lower ([MAX_EYE_LIFT]) so the whites don't blow out.
-     */
     private fun applyEyeBrightness(src: Bitmap, face: FaceData, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
@@ -327,8 +267,6 @@ class ApplyBeautyUseCase {
                     val idx = y * w + x
                     val p = pixels[idx]
                     val luminance = luma(p)
-                    // Only brighten pixels that already look like eye whites/iris
-                    // (luminance > 80); skip dark pixels (eyelashes, eyelid skin)
                     val eyeLikeness = smoothstep(80f, 160f, luminance)
                     if (eyeLikeness <= 0f) continue
 
@@ -349,7 +287,6 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /** Teeth whitening: unchanged from v1 — logic is already solid. */
     private fun applyTeethWhitening(src: Bitmap, face: FaceData, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
@@ -390,18 +327,7 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /**
-     * Unsharp-mask sharpening.
-     *
-     * Changes vs v1:
-     * - Amount capped at [MAX_SHARPEN_AMOUNT] (0.65) — was 1.5, which caused
-     *   halos and made pores look like craters.
-     * - Only applied where maskVal > [SHARPEN_MASK_THRESHOLD] (0.6) to skip
-     *   boundary pixels where halos are most visible.
-     * - Runs first in the pipeline on the original unmodified image, so it
-     *   doesn't amplify artefacts introduced by other effects.
-     */
-    private fun applyFaceSharpening(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    private fun applyFaceSharpening(src: Bitmap, face: FaceData, mask: Array<FloatArray>, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
@@ -411,12 +337,11 @@ class ApplyBeautyUseCase {
         val out = IntArray(w * h)
         result.getPixels(out, 0, w, 0, 0, w, h)
 
-        val amount = strength * MAX_SHARPEN_AMOUNT  // was strength * 1.5f
+        val amount = strength * MAX_SHARPEN_AMOUNT 
 
         for (y in box.top.toInt() until box.bottom.toInt().coerceAtMost(h)) {
             for (x in box.left.toInt() until box.right.toInt().coerceAtMost(w)) {
-                val maskVal = face.segmentationMask.getOrNull(y)?.getOrNull(x) ?: 0f
-                // Skip boundary pixels to avoid halos at mask edges
+                val maskVal = mask.getOrNull(y)?.getOrNull(x) ?: 0f
                 if (maskVal < SHARPEN_MASK_THRESHOLD) continue
 
                 val idx = y * w + x
@@ -434,14 +359,11 @@ class ApplyBeautyUseCase {
 
     // ── HSL colour space helpers ─────────────────────────────────────────────
 
-    /**
-     * RGB (0–255 each) → HSL (H in [0,360), S and L in [0,1]).
-     */
     private fun rgbToHsl(r: Int, g: Int, b: Int): FloatArray {
         val rf = r / 255f; val gf = g / 255f; val bf = b / 255f
         val max = maxOf(rf, gf, bf); val min = minOf(rf, gf, bf)
         val l = (max + min) / 2f
-        if (max == min) return floatArrayOf(0f, 0f, l) // achromatic
+        if (max == min) return floatArrayOf(0f, 0f, l) 
         val d = max - min
         val s = if (l > 0.5f) d / (2f - max - min) else d / (max + min)
         val h = when (max) {
@@ -452,9 +374,6 @@ class ApplyBeautyUseCase {
         return floatArrayOf(h * 360f, s, l)
     }
 
-    /**
-     * HSL (H in [0,360), S and L in [0,1]) → RGB (0–255 each).
-     */
     private fun hslToRgb(h: Float, s: Float, l: Float): IntArray {
         if (s == 0f) {
             val v = (l * 255).toInt().coerceIn(0, 255)
@@ -484,18 +403,45 @@ class ApplyBeautyUseCase {
     // ── Low-level image math ─────────────────────────────────────────────────
 
     /**
-     * Fast separable box-blur approximation of a Gaussian, operating on
-     * packed ARGB int arrays without allocating intermediate Bitmaps.
-     * Used only for blemish reduction and unsharp mask — NOT for skin
-     * smoothing (which uses the bilateral filter above).
+     * 3. NEW: Fast separable box blur to feather the 2D FloatArray mask.
      */
+    private fun preBlurMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
+        if (radius <= 0) return mask
+        val out = Array(h) { FloatArray(w) }
+        val tmp = Array(h) { FloatArray(w) }
+        val div = (2 * radius + 1).toFloat()
+
+        // Horizontal pass
+        for (y in 0 until h) {
+            var sum = 0f
+            for (k in -radius..radius) sum += mask[y][k.coerceIn(0, w - 1)]
+            for (x in 0 until w) {
+                tmp[y][x] = sum / div
+                val addX = (x + radius + 1).coerceIn(0, w - 1)
+                val subX = (x - radius).coerceIn(0, w - 1)
+                sum += mask[y][addX] - mask[y][subX]
+            }
+        }
+        // Vertical pass
+        for (x in 0 until w) {
+            var sum = 0f
+            for (k in -radius..radius) sum += tmp[k.coerceIn(0, h - 1)][x]
+            for (y in 0 until h) {
+                out[y][x] = sum / div
+                val addY = (y + radius + 1).coerceIn(0, h - 1)
+                val subY = (y - radius).coerceIn(0, h - 1)
+                sum += tmp[addY][x] - tmp[subY][x]
+            }
+        }
+        return out
+    }
+
     private fun gaussianBlur(src: IntArray, w: Int, h: Int, radius: Int): IntArray {
         if (radius <= 0) return src
         val tmp = IntArray(w * h)
         val out = IntArray(w * h)
         val div = 2 * radius + 1
 
-        // Horizontal pass
         for (y in 0 until h) {
             var rSum = 0; var gSum = 0; var bSum = 0
             for (k in -radius..radius) {
@@ -516,7 +462,6 @@ class ApplyBeautyUseCase {
             }
         }
 
-        // Vertical pass
         for (x in 0 until w) {
             var rSum = 0; var gSum = 0; var bSum = 0
             for (k in -radius..radius) {
@@ -539,7 +484,6 @@ class ApplyBeautyUseCase {
         return out
     }
 
-    /** Linear interpolation between two packed ARGB pixels by [alpha]. */
     private fun blendPixel(a: Int, b: Int, alpha: Float): Int {
         val t = alpha.coerceIn(0f, 1f)
         val ar = a shr 16 and 0xFF; val br = b shr 16 and 0xFF
@@ -552,7 +496,6 @@ class ApplyBeautyUseCase {
                  ((ab + ((bb - ab) * t).toInt()).coerceIn(0, 255))
     }
 
-    /** BT.601 luma of a packed ARGB pixel. */
     private fun luma(pixel: Int): Float {
         val r = pixel shr 16 and 0xFF
         val g = pixel shr 8  and 0xFF
@@ -560,23 +503,15 @@ class ApplyBeautyUseCase {
         return 0.299f * r + 0.587f * g + 0.114f * b
     }
 
-    /**
-     * Screen blend of a single 0-255 channel with a 0-255 light amount.
-     * Used only for under-eye / teeth / eye-brightness screen lifts.
-     */
     private fun screen(channel: Int, amount: Int): Int =
         (255 - ((255 - channel) * (255 - amount)) / 255).coerceIn(0, 255)
 
-    /** Hermite smoothstep. */
     private fun smoothstep(edge0: Float, edge1: Float, value: Float): Float {
         if (edge0 == edge1) return if (value < edge0) 0f else 1f
         val t = ((value - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
         return t * t * (3f - 2f * t)
     }
 
-    /**
-     * Elliptical feather: 1.0 at centre of [rect], smoothly → 0 at the edge.
-     */
     private fun ellipseFeather(rect: RectF, x: Int, y: Int): Float {
         val cx = rect.centerX(); val cy = rect.centerY()
         val rx = (rect.width()  / 2f).coerceAtLeast(1f)
@@ -584,30 +519,31 @@ class ApplyBeautyUseCase {
         val nx = (x + 0.5f - cx) / rx
         val ny = (y + 0.5f - cy) / ry
         val dist = sqrt(nx * nx + ny * ny)
-        return 1f - smoothstep(0.6f, 1f, dist)
+        // 4. MODIFIED: Changed from 0.6f to 0.0f to kill the pill-shaped halos
+        return 1f - smoothstep(0.0f, 1f, dist)
     }
 
     companion object {
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.3f
-        private const val MAX_BILATERAL_RADIUS      = 6        // was Gaussian 12 — much more conservative
-        private const val BILATERAL_SPATIAL_SIGMA   = 3f       // controls spatial falloff
-        private const val BILATERAL_COLOR_SIGMA     = 30f      // lower = more edge-preserving
-        private const val TEXTURE_PRESERVE_AMOUNT   = 0.28f    // HF detail blended back after bilateral
+        private const val MAX_BILATERAL_RADIUS      = 6       
+        private const val BILATERAL_SPATIAL_SIGMA   = 3f       
+        private const val BILATERAL_COLOR_SIGMA     = 30f      
+        private const val TEXTURE_PRESERVE_AMOUNT   = 0.28f    
 
         // Brightness
-        private const val MAX_LIGHTNESS_LIFT        = 0.12f    // max HSL L raise (≈ 30/255)
+        private const val MAX_LIGHTNESS_LIFT        = 0.12f    
 
         // Eye brightness
-        private const val MAX_EYE_LIFT              = 40f      // was 70 — prevents whites blowing out
+        private const val MAX_EYE_LIFT              = 40f      
 
-        // Blemish reduction (unchanged)
+        // Blemish reduction
         private const val BLEMISH_BLUR_RADIUS       = 8
         private const val BLEMISH_DARK_THRESHOLD    = 20f
 
         // Sharpening
         private const val SHARPEN_BLUR_RADIUS       = 2
-        private const val MAX_SHARPEN_AMOUNT        = 0.65f    // was 1.5 — eliminates halos
-        private const val SHARPEN_MASK_THRESHOLD    = 0.6f     // skip low-confidence boundary pixels
+        private const val MAX_SHARPEN_AMOUNT        = 0.65f    
+        private const val SHARPEN_MASK_THRESHOLD    = 0.6f     
     }
 }
