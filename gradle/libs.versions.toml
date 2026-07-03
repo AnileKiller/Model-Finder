@@ -6,10 +6,10 @@ lifecycleRuntime = "2.8.6"
 activityCompose = "1.9.2"
 composeBom = "2024.09.03"
 coroutines = "1.9.0"
-tensorflow-lite = "2.16.1"
+tensorflow-lite = "2.17.0"
 tensorflow-lite-support = "0.4.4"
-tensorflow-lite-gpu = "2.16.1"
-tensorflow-lite-gpu-api = "2.16.1"
+tensorflow-lite-gpu = "2.17.0"
+tensorflow-lite-gpu-api = "2.17.0"
 coil = "2.7.0"
 
 [libraries]
