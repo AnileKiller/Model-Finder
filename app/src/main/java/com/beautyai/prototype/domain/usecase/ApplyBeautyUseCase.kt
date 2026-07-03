@@ -321,39 +321,57 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         result.getPixels(pixels, 0, w, 0, 0, w, h)
         val mouthRect = face.mouthRect(w, h)
-        val liftAmount = (strength * 50f).toInt().coerceIn(0, 255)
+        
+        // Increased the max lift slightly for a cleaner white
+        val liftAmount = (strength * 60f).toInt().coerceIn(0, 255)
 
-        for (y in mouthRect.top.toInt() until mouthRect.bottom.toInt().coerceAtMost(h)) {
-            for (x in mouthRect.left.toInt() until mouthRect.right.toInt().coerceAtMost(w)) {
+        for (y in mouthRect.top.toInt().coerceAtLeast(0) until mouthRect.bottom.toInt().coerceAtMost(h - 1)) {
+            for (x in mouthRect.left.toInt().coerceAtLeast(0) until mouthRect.right.toInt().coerceAtMost(w - 1)) {
                 val idx = y * w + x
                 val p = pixels[idx]
                 val a = p ushr 24
                 val r = p shr 16 and 0xFF
                 val g = p shr 8  and 0xFF
                 val b = p        and 0xFF
-                val maxC = maxOf(r, g, b)
-                val minC = minOf(r, g, b)
-                val luminance = (r + g + b) / 3f
-                val saturation = if (maxC == 0) 0f else (maxC - minC) / maxC.toFloat()
-                val teethLikeness =
-                    smoothstep(110f, 190f, luminance) * (1f - smoothstep(0.25f, 0.6f, saturation))
+                
+                // Using the existing luma helper function
+                val luminance = luma(p) 
+                
+                // 1. THE NEW GATEKEEPER
+                // Lips and gums have high Red and low Green. Yellow teeth have high Red AND high Green.
+                val redness = (r - g).toFloat()
+                
+                // If luminance is high enough AND redness is low, it is a tooth.
+                // This allows highly saturated yellow to pass, but strictly blocks pink/red lips.
+                val teethLikeness = smoothstep(90f, 160f, luminance) * (1f - smoothstep(20f, 50f, redness))
+                
                 if (teethLikeness <= 0f) continue
 
-                val avg = (r + g + b) / 3
-                val nr = (r + (avg - r) * strength * 0.5f).toInt().coerceIn(0, 255)
-                val ng = (g + (avg - g) * strength * 0.5f).toInt().coerceIn(0, 255)
-                val nb = (b + (avg - b) * strength * 0.5f).toInt().coerceIn(0, 255)
+                // 2. THE NEW WHITENING MATH
+                // Find the brightest channel (usually Red or Green in stained teeth)
+                val maxC = maxOf(r, maxOf(g, b)).toFloat()
+                
+                // Neutralize the yellow by boosting the weaker channels (especially Blue) up to the max channel
+                val desatStrength = strength * 0.85f // Keep a tiny bit of natural warmth
+                val nr = (r + (maxC - r) * desatStrength).toInt()
+                val ng = (g + (maxC - g) * desatStrength).toInt()
+                val nb = (b + (maxC - b) * desatStrength).toInt() // Blue gets the biggest boost, killing the yellow
+
+                // Apply the screen blend for that glowing finish
                 val lifted = (a shl 24) or
                         (screen(nr, liftAmount) shl 16) or
                         (screen(ng, liftAmount) shl 8) or
                         screen(nb, liftAmount)
+                        
                 val feather = ellipseFeather(mouthRect, x, y)
+                
                 pixels[idx] = blendPixel(p, lifted, strength * feather * teethLikeness)
             }
         }
         result.setPixels(pixels, 0, w, 0, 0, w, h)
         return result
     }
+
 
     private fun applyFaceSharpening(src: Bitmap, face: FaceData, mask: Array<FloatArray>, strength: Float): Bitmap {
         val w = src.width; val h = src.height
