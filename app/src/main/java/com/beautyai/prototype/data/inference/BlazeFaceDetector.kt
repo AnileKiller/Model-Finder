@@ -50,19 +50,43 @@ class BlazeFaceDetector(context: Context) : AutoCloseable {
 
     init {
         val modelBuffer = loadModelFile(context, MODEL_FILE)
-        val compatList = CompatibilityList()
-        val options = Interpreter.Options().apply {
-            if (compatList.isDelegateSupportedOnThisDevice) {
-                val delegateOptions = compatList.bestOptionsForThisDevice
-                gpuDelegate = GpuDelegate(delegateOptions)
-                addDelegate(gpuDelegate)
-            } else {
-                gpuDelegate = null
-                setNumThreads(4)
-                setUseNNAPI(true)
+        val compatList  = CompatibilityList()
+        var gpu: GpuDelegate? = null
+
+        // Three-level acceleration fallback:
+        //  1. GPU delegate  — hardware-accelerated; fastest on most devices.
+        //  2. NNAPI         — Android neural-network API; accelerated on DSP/NPU
+        //                     when GPU is unavailable or its delegate throws.
+        //  3. CPU (4 threads) — always available; guaranteed not to throw.
+        //
+        // Each tier is wrapped in try/catch because CompatibilityList is a
+        // pre-flight check only — GpuDelegate or Interpreter construction can
+        // still throw at runtime on some chipsets/drivers, and NNAPI support
+        // varies by device and model op-set. Without the catch the app crashes
+        // silently instead of degrading gracefully.
+        interpreter = if (compatList.isDelegateSupportedOnThisDevice) {
+            try {
+                gpu = GpuDelegate(compatList.bestOptionsForThisDevice)
+                Interpreter(modelBuffer, Interpreter.Options().addDelegate(gpu))
+            } catch (e: Exception) {
+                gpu?.close(); gpu = null
+                try {
+                    Interpreter(modelBuffer, Interpreter.Options()
+                        .setUseNNAPI(true).setNumThreads(4))
+                } catch (e2: Exception) {
+                    Interpreter(modelBuffer, Interpreter.Options().setNumThreads(4))
+                }
+            }
+        } else {
+            try {
+                Interpreter(modelBuffer, Interpreter.Options()
+                    .setUseNNAPI(true).setNumThreads(4))
+            } catch (e: Exception) {
+                Interpreter(modelBuffer, Interpreter.Options().setNumThreads(4))
             }
         }
-        interpreter = Interpreter(modelBuffer, options)
+
+        gpuDelegate = gpu
     }
 
     /**
