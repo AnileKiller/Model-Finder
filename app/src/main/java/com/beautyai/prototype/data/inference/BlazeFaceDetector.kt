@@ -2,6 +2,7 @@ package com.beautyai.prototype.data.inference
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.RectF
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -65,29 +66,54 @@ class BlazeFaceDetector(context: Context) : AutoCloseable {
     }
 
     /**
-     * Runs BlazeFace inference on [bitmap] and returns the bounding box
-     * of the most confident face detection in normalised [0,1] coordinates,
-     * or null if no face is found above [confidenceThreshold].
+     * Runs BlazeFace inference on [bitmap] and returns the bounding box of the
+     * most confident face in **pixel coordinates** relative to [bitmap], or null
+     * if no face is found above [confidenceThreshold].
+     *
+     * The full image is letterboxed (aspect-ratio-preserving black padding) to
+     * the model's 128×128 input. The detected box is then un-letterboxed back to
+     * true pixel coordinates. Without this, squishing a landscape or portrait
+     * photo to a square shifts and stretches the returned bounding box, which
+     * propagates an incorrect crop into FaceMesh.
      */
     fun detect(bitmap: Bitmap, confidenceThreshold: Float = 0.7f): RectF? {
-        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        fillInputBuffer(scaled)
+        val imgW  = bitmap.width.toFloat()
+        val imgH  = bitmap.height.toFloat()
 
-        val outputMap = mapOf(
-            0 to regressors,
-            1 to scores
-        )
+        // Uniform scale that fits the full image inside 128×128
+        val scale  = minOf(inputSize / imgW, inputSize / imgH)
+        val scaledW = (imgW * scale).toInt().coerceAtLeast(1)
+        val scaledH = (imgH * scale).toInt().coerceAtLeast(1)
+        val padX   = (inputSize - scaledW) / 2f
+        val padY   = (inputSize - scaledH) / 2f
+
+        fillInputBuffer(letterboxBitmap(bitmap, scaledW, scaledH))
+
+        val outputMap = mapOf(0 to regressors, 1 to scores)
         interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
 
         return decodeBoxes(
             regressors[0], scores[0],
-            imageWidth = bitmap.width.toFloat(),
-            imageHeight = bitmap.height.toFloat(),
+            padX = padX, padY = padY, scale = scale,
+            imageWidth = imgW, imageHeight = imgH,
             threshold = confidenceThreshold
         )
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Scales [src] to [scaledW]×[scaledH] (aspect-ratio-preserving) and centres
+     * it on a black [inputSize]×[inputSize] canvas — the same letterbox approach
+     * used in FaceMeshDetector.
+     */
+    private fun letterboxBitmap(src: Bitmap, scaledW: Int, scaledH: Int): Bitmap {
+        val scaled      = Bitmap.createScaledBitmap(src, scaledW, scaledH, true)
+        val letterboxed = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+        val canvas      = Canvas(letterboxed)
+        canvas.drawBitmap(scaled, (inputSize - scaledW) / 2f, (inputSize - scaledH) / 2f, null)
+        return letterboxed
+    }
 
     private fun fillInputBuffer(bitmap: Bitmap) {
         inputBuffer.rewind()
@@ -101,9 +127,23 @@ class BlazeFaceDetector(context: Context) : AutoCloseable {
         }
     }
 
+    /**
+     * Decodes the raw BlazeFace regressions + anchor offsets into a [RectF] in
+     * **original pixel coordinates**, correctly undoing the letterbox transform.
+     *
+     * The model operates in letterboxed 128×128 space.  To map a detected centre
+     * (cx_lb, cy_lb) — in [0,1] of the 128×128 canvas — back to the original:
+     *   1. Multiply by inputSize to get pixel position in the letterboxed canvas.
+     *   2. Subtract [padX]/[padY] to remove the black-bar offset.
+     *   3. Divide by [scale] to undo the uniform scale-down.
+     * Width/height follow the same division by [scale] (no pad subtraction needed).
+     */
     private fun decodeBoxes(
         regressions: Array<FloatArray>,
         classScores: Array<FloatArray>,
+        padX: Float,
+        padY: Float,
+        scale: Float,
         imageWidth: Float,
         imageHeight: Float,
         threshold: Float
@@ -116,17 +156,25 @@ class BlazeFaceDetector(context: Context) : AutoCloseable {
             if (score <= bestScore) continue
 
             val anchor = anchors[i]
+
+            // cx, cy, w, h are in [0,1] relative to the 128×128 letterboxed input
             val cx = regressions[i][0] / inputSize + anchor[0]
             val cy = regressions[i][1] / inputSize + anchor[1]
             val w  = regressions[i][2] / inputSize
             val h  = regressions[i][3] / inputSize
 
+            // Convert to pixel coords in letterboxed space, undo padding, undo scale
+            val cxPx = (cx * inputSize - padX) / scale
+            val cyPx = (cy * inputSize - padY) / scale
+            val wPx  = (w  * inputSize) / scale
+            val hPx  = (h  * inputSize) / scale
+
             bestScore = score
             bestBox = RectF(
-                ((cx - w / 2f) * imageWidth).coerceIn(0f, imageWidth),
-                ((cy - h / 2f) * imageHeight).coerceIn(0f, imageHeight),
-                ((cx + w / 2f) * imageWidth).coerceIn(0f, imageWidth),
-                ((cy + h / 2f) * imageHeight).coerceIn(0f, imageHeight)
+                (cxPx - wPx / 2f).coerceIn(0f, imageWidth),
+                (cyPx - hPx / 2f).coerceIn(0f, imageHeight),
+                (cxPx + wPx / 2f).coerceIn(0f, imageWidth),
+                (cyPx + hPx / 2f).coerceIn(0f, imageHeight)
             )
         }
         return bestBox
