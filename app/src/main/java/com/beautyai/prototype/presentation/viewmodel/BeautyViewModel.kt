@@ -55,10 +55,16 @@ class BeautyViewModel(application: Application) : AndroidViewModel(application) 
     private val _saveSuccess = MutableStateFlow<String?>(null)
     val saveSuccess: StateFlow<String?> = _saveSuccess.asStateFlow()
 
+    private val _showMaskOverlay = MutableStateFlow(false)
+    val showMaskOverlay: StateFlow<Boolean> = _showMaskOverlay.asStateFlow()
+
     // ── Cached analysis results ──────────────────────────────────────────────
 
     /** Holds the last successfully analysed face so slider tweaks don't re-run inference. */
     private var cachedFaceData: FaceData? = null
+
+    /** Holds the last clean (non-overlaid) enhanced bitmap for overlay toggling. */
+    private var cachedEnhanced: android.graphics.Bitmap? = null
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -92,10 +98,19 @@ class BeautyViewModel(application: Application) : AndroidViewModel(application) 
                         bitmap
                     }
                 }
+                cachedEnhanced = enhanced
+
+                val displayed = withContext(Dispatchers.Default) {
+                    if (_showMaskOverlay.value && faceData != null) {
+                        applyBeauty.renderMaskDebugOverlay(enhanced, faceData)
+                    } else {
+                        enhanced
+                    }
+                }
 
                 _processingState.value = ProcessingState.Success(
                     original = bitmap,
-                    enhanced = enhanced,
+                    enhanced = displayed,
                     faceData = faceData
                 )
             }.onFailure { e ->
@@ -126,7 +141,17 @@ class BeautyViewModel(application: Application) : AndroidViewModel(application) 
                         current.original
                     }
                 }
-                _processingState.value = current.copy(enhanced = enhanced)
+                cachedEnhanced = enhanced
+
+                val displayed = withContext(Dispatchers.Default) {
+                    val faceData = cachedFaceData
+                    if (_showMaskOverlay.value && faceData != null) {
+                        applyBeauty.renderMaskDebugOverlay(enhanced, faceData)
+                    } else {
+                        enhanced
+                    }
+                }
+                _processingState.value = current.copy(enhanced = displayed)
             }
             _isReprocessing.value = false
         }
@@ -140,6 +165,36 @@ class BeautyViewModel(application: Application) : AndroidViewModel(application) 
     /** Toggle between showing the original and the enhanced image. */
     fun toggleOriginal() {
         _showOriginal.update { !it }
+    }
+
+    /**
+     * Toggle the debug mask overlay on/off.
+     * Green = active skin zone, Red = excluded feature zone (eyes/lips/etc).
+     */
+    fun toggleMaskOverlay() {
+        val current = _processingState.value as? ProcessingState.Success ?: run {
+            _showMaskOverlay.update { !it }
+            return
+        }
+        val faceData = cachedFaceData
+        val base = cachedEnhanced ?: current.enhanced
+        _showMaskOverlay.update { !it }
+        val nowOn = _showMaskOverlay.value
+
+        viewModelScope.launch {
+            _isReprocessing.value = true
+            runCatching {
+                val displayed = withContext(Dispatchers.Default) {
+                    if (nowOn && faceData != null) {
+                        applyBeauty.renderMaskDebugOverlay(base, faceData)
+                    } else {
+                        base
+                    }
+                }
+                _processingState.value = current.copy(enhanced = displayed)
+            }
+            _isReprocessing.value = false
+        }
     }
 
     /** Save the currently enhanced image to the gallery. */
