@@ -44,24 +44,27 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             BeautyAITheme {
-                val processingState by viewModel.processingState.collectAsState()
-                val beautyParams    by viewModel.beautyParams.collectAsState()
-                val isReprocessing  by viewModel.isReprocessing.collectAsState()
-                val showOriginal    by viewModel.showOriginal.collectAsState()
-                val saveSuccess     by viewModel.saveSuccess.collectAsState()
+                val processingState  by viewModel.processingState.collectAsState()
+                val beautyParams     by viewModel.beautyParams.collectAsState()
+                val isReprocessing   by viewModel.isReprocessing.collectAsState()
+                val showOriginal     by viewModel.showOriginal.collectAsState()
+                val showMaskOverlay  by viewModel.showMaskOverlay.collectAsState()
+                val saveSuccess      by viewModel.saveSuccess.collectAsState()
 
                 MainScreen(
-                    processingState = processingState,
-                    beautyParams    = beautyParams,
-                    isReprocessing  = isReprocessing,
-                    showOriginal    = showOriginal,
-                    saveSuccess     = saveSuccess,
-                    onSelectImage   = { imagePickerLauncher.launch("image/*") },
-                    onParamsChange  = viewModel::updateParams,
-                    onReset         = viewModel::resetParams,
-                    onToggleOriginal= viewModel::toggleOriginal,
-                    onSave          = viewModel::saveImage,
-                    onDismissSave   = viewModel::clearSaveMessage
+                    processingState     = processingState,
+                    beautyParams        = beautyParams,
+                    isReprocessing      = isReprocessing,
+                    showOriginal        = showOriginal,
+                    showMaskOverlay     = showMaskOverlay,
+                    saveSuccess         = saveSuccess,
+                    onSelectImage       = { imagePickerLauncher.launch("image/*") },
+                    onParamsChange      = viewModel::updateParams,
+                    onReset             = viewModel::resetParams,
+                    onToggleOriginal    = viewModel::toggleOriginal,
+                    onToggleMaskOverlay = viewModel::toggleMaskOverlay,
+                    onSave              = viewModel::saveImage,
+                    onDismissSave       = viewModel::clearSaveMessage
                 )
             }
         }
