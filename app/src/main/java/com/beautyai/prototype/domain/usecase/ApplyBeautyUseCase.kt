@@ -1,6 +1,10 @@
 package com.beautyai.prototype.domain.usecase
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import com.beautyai.prototype.domain.model.BeautyParameters
 import com.beautyai.prototype.domain.model.FaceData
@@ -16,9 +20,12 @@ class ApplyBeautyUseCase {
         val effective = params.withGlobalIntensity()
         var result = source.copy(Bitmap.Config.ARGB_8888, true)
 
-        // 1. NEW: Pre-blur the segmentation mask to eliminate the "Phantom Mask" hard edges.
-        // A radius of 8-12 pixels creates a smooth gradient falloff at the borders.
-        val blurredMask = preBlurMask(faceData.segmentationMask, source.width, source.height, 12)
+        // 1. Punch geometric exclusion zones (eyes, eyebrows, lips, nostrils) into the raw
+        //    segmentation mask so that structural facial features are never smoothed or corrected.
+        val refinedMask = punchExclusionZones(faceData.segmentationMask, faceData, source.width, source.height)
+
+        // 2. Pre-blur the refined mask to feather the punched-out holes and eliminate hard edges.
+        val blurredMask = preBlurMask(refinedMask, source.width, source.height, 12)
 
         // Sharpening first — works on original, unmodified detail
         if (effective.faceSharpening > 0f)
@@ -204,7 +211,7 @@ class ApplyBeautyUseCase {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
-        
+
         // I recommend lowering this radius in your companion object from 8 to 5. 
         // A radius of 8 pulls colors from too far away, which causes color bleeding near edges.
         val blurred = gaussianBlur(pixels, w, h, 5) 
@@ -216,29 +223,29 @@ class ApplyBeautyUseCase {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
                 if (maskVal < MASK_THRESHOLD) continue
-                
+
                 val idx = y * w + x
                 val p = pixels[idx]
                 val bp = blurred[idx]
-                
+
                 val pLuma = luma(p)
                 val bLuma = luma(bp)
                 val diff = bLuma - pLuma
-                
+
                 // 1. Check if it falls inside the "Blemish Zone" (Darker than skin, but not as dark as an eye)
                 if (diff > BLEMISH_DARK_THRESHOLD && diff < MAX_BLEMISH_DIFFERENCE) {
-                    
+
                     // 2. Taper the effect near the limits to prevent harsh pixelated cutoffs
                     val edgeProtection = 1f - smoothstep(MAX_BLEMISH_DIFFERENCE - 15f, MAX_BLEMISH_DIFFERENCE, diff)
-                    
+
                     // Apply the fix, respecting the mask, user strength, and edge protection
                     val finalAlpha = maskVal * strength * 0.8f * edgeProtection
-                    
+
                     pixels[idx] = blendPixel(p, bp, finalAlpha)
                 }
             }
         }
-        
+
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         result.setPixels(pixels, 0, w, 0, 0, w, h)
         return result
@@ -259,7 +266,7 @@ class ApplyBeautyUseCase {
                 eyeRect.right + eyeRect.width() * 0.15f, 
                 eyeRect.bottom + eyeRect.height() * 0.9f
             )
-            
+
             // Lowered the global max lift slightly so it doesn't wash out
             val liftAmount = (strength * 45f).toInt().coerceIn(0, 255)
 
@@ -267,34 +274,34 @@ class ApplyBeautyUseCase {
                 for (x in underRect.left.toInt().coerceAtLeast(0) until underRect.right.toInt().coerceAtMost(w - 1)) {
                     val idx = y * w + x
                     val p = pixels[idx]
-                    
+
                     val luminance = luma(p)
-                    
+
                     // 2. LUMINANCE GATING: Target ONLY the dark shadows.
                     // If luminance < 70 (dark shadow), shadowLikeness is 1.0 (Full effect).
                     // If luminance > 140 (bright cheekbone), shadowLikeness is 0.0 (No effect).
                     val shadowLikeness = 1f - smoothstep(70f, 140f, luminance)
-                    
+
                     // Skip pixels that are already bright to prevent the white "stroke" effect
                     if (shadowLikeness <= 0f) continue 
-                    
+
                     val a = p ushr 24
-                    
+
                     // 3. COLOR CORRECTION: Eye bags are usually blue/purple. 
                     // Pushing a pure screen blend makes them ashy/gray. 
                     // We lift Red slightly more than Blue to warm the shadow up and match natural skin.
                     val rLift = (liftAmount * 1.15f).toInt().coerceIn(0, 255)
                     val bLift = (liftAmount * 0.85f).toInt().coerceIn(0, 255)
-                    
+
                     val r = screen(p shr 16 and 0xFF, rLift)
                     val g = screen(p shr 8  and 0xFF, liftAmount)
                     val b = screen(p        and 0xFF, bLift)
-                    
+
                     val feather = ellipseFeather(underRect, x, y)
-                    
+
                     // Combine user strength, geometric feathering, and shadow targeting
                     val finalAlpha = strength * feather * shadowLikeness
-                    
+
                     pixels[idx] = blendPixel(p, (a shl 24) or (r shl 16) or (g shl 8) or b, finalAlpha)
                 }
             }
@@ -342,7 +349,7 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         result.getPixels(pixels, 0, w, 0, 0, w, h)
         val mouthRect = face.mouthRect(w, h)
-        
+
         // Increased the max lift slightly for a cleaner white
         val liftAmount = (strength * 60f).toInt().coerceIn(0, 255)
 
@@ -354,24 +361,24 @@ class ApplyBeautyUseCase {
                 val r = p shr 16 and 0xFF
                 val g = p shr 8  and 0xFF
                 val b = p        and 0xFF
-                
+
                 // Using the existing luma helper function
                 val luminance = luma(p) 
-                
+
                 // 1. THE NEW GATEKEEPER
                 // Lips and gums have high Red and low Green. Yellow teeth have high Red AND high Green.
                 val redness = (r - g).toFloat()
-                
+
                 // If luminance is high enough AND redness is low, it is a tooth.
                 // This allows highly saturated yellow to pass, but strictly blocks pink/red lips.
                 val teethLikeness = smoothstep(90f, 160f, luminance) * (1f - smoothstep(20f, 50f, redness))
-                
+
                 if (teethLikeness <= 0f) continue
 
                 // 2. THE NEW WHITENING MATH
                 // Find the brightest channel (usually Red or Green in stained teeth)
                 val maxC = maxOf(r, maxOf(g, b)).toFloat()
-                
+
                 // Neutralize the yellow by boosting the weaker channels (especially Blue) up to the max channel
                 val desatStrength = strength * 0.85f // Keep a tiny bit of natural warmth
                 val nr = (r + (maxC - r) * desatStrength).toInt()
@@ -383,9 +390,9 @@ class ApplyBeautyUseCase {
                         (screen(nr, liftAmount) shl 16) or
                         (screen(ng, liftAmount) shl 8) or
                         screen(nb, liftAmount)
-                        
+
                 val feather = ellipseFeather(mouthRect, x, y)
-                
+
                 pixels[idx] = blendPixel(p, lifted, strength * feather * teethLikeness)
             }
         }
@@ -588,6 +595,157 @@ class ApplyBeautyUseCase {
         val dist = sqrt(nx * nx + ny * ny)
         // 4. MODIFIED: Changed from 0.6f to 0.0f to kill the pill-shaped halos
         return 1f - smoothstep(0.0f, 1f, dist)
+    }
+
+    // ── Debug overlay ────────────────────────────────────────────────────────
+
+    /**
+     * Renders a colour-coded mask overlay on top of [source] for debugging.
+     *
+     *  • **Green** (semi-transparent) — pixels inside the active skin zone that
+     *    beauty effects will touch.
+     *  • **Red** (semi-transparent) — pixels that were inside the raw segmentation
+     *    mask but have been punched out as exclusion zones (eyes, eyebrows, lips,
+     *    nostrils).
+     *  • **No tint** — background / non-face pixels that are always skipped.
+     *
+     * Call this instead of [invoke] when the debug toggle is on.
+     */
+    fun renderMaskDebugOverlay(source: Bitmap, faceData: FaceData): Bitmap {
+        val w = source.width
+        val h = source.height
+        val baseMask    = faceData.segmentationMask
+        val refinedMask = punchExclusionZones(baseMask, faceData, w, h)
+
+        val pixels = IntArray(w * h)
+        source.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val idx      = y * w + x
+                val baseVal  = baseMask[y][x]
+                val refined  = refinedMask[y][x]
+                val p        = pixels[idx]
+                val a        = p ushr 24
+                val r        = p shr 16 and 0xFF
+                val g        = p shr 8  and 0xFF
+                val b        = p        and 0xFF
+
+                pixels[idx] = when {
+                    // Active skin zone — tint green
+                    refined >= MASK_THRESHOLD -> {
+                        val tintAlpha = (refined * 0.45f).coerceIn(0f, 1f)
+                        val nr = (r + (0   - r) * tintAlpha).toInt().coerceIn(0, 255)
+                        val ng = (g + (200 - g) * tintAlpha).toInt().coerceIn(0, 255)
+                        val nb = (b + (80  - b) * tintAlpha).toInt().coerceIn(0, 255)
+                        (a shl 24) or (nr shl 16) or (ng shl 8) or nb
+                    }
+                    // Punched-out exclusion zone — tint red
+                    baseVal >= MASK_THRESHOLD -> {
+                        val tintAlpha = (baseVal * 0.50f).coerceIn(0f, 1f)
+                        val nr = (r + (220 - r) * tintAlpha).toInt().coerceIn(0, 255)
+                        val ng = (g + (0   - g) * tintAlpha).toInt().coerceIn(0, 255)
+                        val nb = (b + (60  - b) * tintAlpha).toInt().coerceIn(0, 255)
+                        (a shl 24) or (nr shl 16) or (ng shl 8) or nb
+                    }
+                    // Background — pass through unchanged
+                    else -> p
+                }
+            }
+        }
+
+        val out = source.copy(Bitmap.Config.ARGB_8888, true)
+        out.setPixels(pixels, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    // ── Exclusion zone helpers ────────────────────────────────────────────────
+
+    /**
+     * Punches black "holes" into [baseMask] at the locations of eyes, eyebrows,
+     * outer lips, and nostrils derived from the 468 FaceMesh landmarks.
+     * Every pixel inside those polygons is set to 0.0 so that downstream
+     * smoothing and blemish-reduction loops skip them instantly via the
+     * MASK_THRESHOLD check — no extra per-pixel logic required.
+     */
+    private fun punchExclusionZones(
+        baseMask: Array<FloatArray>,
+        faceData: FaceData,
+        w: Int,
+        h: Int
+    ): Array<FloatArray> {
+        val maskBitmap = floatArrayToBitmap(baseMask, w, h)
+        val canvas = Canvas(maskBitmap)
+
+        val eraserPaint = Paint().apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+
+        fun drawPolygon(indices: List<Int>) {
+            if (indices.isEmpty()) return
+            val path = Path()
+            val first = faceData.landmarks[indices[0]]
+            path.moveTo(first.x * w, first.y * h)
+            for (i in 1 until indices.size) {
+                val lm = faceData.landmarks[indices[i]]
+                path.lineTo(lm.x * w, lm.y * h)
+            }
+            path.close()
+            canvas.drawPath(path, eraserPaint)
+        }
+
+        // Left eye contour (MediaPipe canonical indices)
+        drawPolygon(listOf(33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246))
+
+        // Right eye contour
+        drawPolygon(listOf(362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398))
+
+        // Left eyebrow
+        drawPolygon(listOf(46, 53, 52, 65, 55, 107, 66, 105, 63, 70))
+
+        // Right eyebrow
+        drawPolygon(listOf(276, 283, 282, 295, 285, 336, 296, 334, 293, 300))
+
+        // Outer lips
+        drawPolygon(listOf(61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185))
+
+        // Nostrils / nose base
+        drawPolygon(listOf(4, 45, 51, 5, 281, 275, 440, 220))
+
+        return bitmapToFloatArray(maskBitmap, w, h)
+    }
+
+    /**
+     * Converts a 2-D FloatArray mask (values 0–1) into a greyscale ARGB_8888 Bitmap
+     * so Android Canvas can draw exclusion polygons onto it.
+     */
+    private fun floatArrayToBitmap(mask: Array<FloatArray>, w: Int, h: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val v = (mask[y][x].coerceIn(0f, 1f) * 255f).toInt()
+                pixels[y * w + x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            }
+        }
+        bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+        return bmp
+    }
+
+    /**
+     * Converts a greyscale ARGB_8888 Bitmap back into a 2-D FloatArray mask.
+     * Uses the red channel (equal to green and blue in a greyscale image).
+     */
+    private fun bitmapToFloatArray(bmp: Bitmap, w: Int, h: Int): Array<FloatArray> {
+        val pixels = IntArray(w * h)
+        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+        return Array(h) { y ->
+            FloatArray(w) { x ->
+                ((pixels[y * w + x] shr 16) and 0xFF) / 255f
+            }
+        }
     }
 
     companion object {
