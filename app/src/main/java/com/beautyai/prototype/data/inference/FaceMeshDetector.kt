@@ -2,6 +2,7 @@ package com.beautyai.prototype.data.inference
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.RectF
 import com.beautyai.prototype.domain.model.Landmark
 import org.tensorflow.lite.Interpreter
@@ -60,35 +61,55 @@ class FaceMeshDetector(context: Context) : AutoCloseable {
      * Runs FaceMesh on the region of [bitmap] specified by [faceBox].
      * Returns 468 landmarks in normalised [0,1] coordinates relative to the
      * *original* [bitmap], or null if the face presence score is too low.
+     *
+     * The face crop is letterboxed (aspect-ratio-preserving padding) before
+     * being fed to the model. This prevents the squish distortion that occurs
+     * when a non-square crop is forcefully scaled to the model's 192×192 input.
+     * Without letterboxing, the model finds landmarks on a geometrically wrong
+     * face, and the back-mapped coordinates float in the wrong direction
+     * depending on the photo's aspect ratio (portrait vs. landscape).
      */
     fun detect(bitmap: Bitmap, faceBox: RectF, presenceThreshold: Float = 0.5f): List<Landmark>? {
-        // Crop the detected face region and scale to 192×192
-        val cropped = cropAndScale(bitmap, faceBox)
-        fillInputBuffer(cropped)
+        // Clamp crop dimensions to image bounds
+        val cropLeft = faceBox.left.toInt().coerceAtLeast(0)
+        val cropTop  = faceBox.top.toInt().coerceAtLeast(0)
+        val cropW    = faceBox.width().toInt().coerceAtMost(bitmap.width  - cropLeft)
+        val cropH    = faceBox.height().toInt().coerceAtMost(bitmap.height - cropTop)
 
-        val outputMap = mapOf(
-            0 to landmarksOut,
-            1 to scoreOut
-        )
+        // Scale factor that fits the crop into inputSize×inputSize with no squish
+        val scale  = minOf(inputSize.toFloat() / cropW, inputSize.toFloat() / cropH)
+        val scaledW = (cropW * scale).toInt().coerceAtLeast(1)
+        val scaledH = (cropH * scale).toInt().coerceAtLeast(1)
+
+        // Padding offsets (letterbox bars)
+        val padX = (inputSize - scaledW) / 2f
+        val padY = (inputSize - scaledH) / 2f
+
+        val letterboxed = cropAndScaleLetterbox(bitmap, cropLeft, cropTop, cropW, cropH, scaledW, scaledH)
+        fillInputBuffer(letterboxed)
+
+        val outputMap = mapOf(0 to landmarksOut, 1 to scoreOut)
         interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
 
         val presenceScore = sigmoid(scoreOut[0][0][0][0])
         if (presenceScore < presenceThreshold) return null
 
-        // Denormalise from [0, 192] crop-space back to original image space
-        val cropX = faceBox.left / bitmap.width
-        val cropY = faceBox.top  / bitmap.height
-        val cropW = faceBox.width()  / bitmap.width
-        val cropH = faceBox.height() / bitmap.height
-
         val flat = landmarksOut[0][0][0]
         return List(468) { i ->
-            val normX = flat[i * 3]     / inputSize
-            val normY = flat[i * 3 + 1] / inputSize
-            val z     = flat[i * 3 + 2]
+            val modelX = flat[i * 3]
+            val modelY = flat[i * 3 + 1]
+            val z      = flat[i * 3 + 2]
+
+            // 1. Subtract letterbox padding to get position inside the scaled crop
+            // 2. Divide by scale to get pixel position within the original crop
+            val cropXPx = (modelX - padX) / scale
+            val cropYPx = (modelY - padY) / scale
+
+            // 3. Add bounding-box origin to anchor back to full-image space,
+            //    then normalise to [0, 1] relative to the full image dimensions
             Landmark(
-                x = cropX + normX * cropW,
-                y = cropY + normY * cropH,
+                x = (cropLeft + cropXPx) / bitmap.width,
+                y = (cropTop  + cropYPx) / bitmap.height,
                 z = z
             )
         }
@@ -96,13 +117,24 @@ class FaceMeshDetector(context: Context) : AutoCloseable {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    private fun cropAndScale(src: Bitmap, box: RectF): Bitmap {
-        val x = box.left.toInt().coerceAtLeast(0)
-        val y = box.top.toInt().coerceAtLeast(0)
-        val w = box.width().toInt().coerceAtMost(src.width - x)
-        val h = box.height().toInt().coerceAtMost(src.height - y)
-        val cropped = Bitmap.createBitmap(src, x, y, w, h)
-        return Bitmap.createScaledBitmap(cropped, inputSize, inputSize, true)
+    /**
+     * Crops [src] to the given pixel region, scales it to [scaledW]×[scaledH]
+     * (aspect-ratio-preserving), then centres it on a black [inputSize]×[inputSize]
+     * canvas — producing a letterboxed input for the FaceMesh model.
+     */
+    private fun cropAndScaleLetterbox(
+        src: Bitmap,
+        cropLeft: Int, cropTop: Int, cropW: Int, cropH: Int,
+        scaledW: Int, scaledH: Int
+    ): Bitmap {
+        val cropped  = Bitmap.createBitmap(src, cropLeft, cropTop, cropW, cropH)
+        val scaled   = Bitmap.createScaledBitmap(cropped, scaledW, scaledH, true)
+
+        // Black canvas — padding pixels stay 0 and are ignored by the model
+        val letterboxed = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(letterboxed)
+        canvas.drawBitmap(scaled, (inputSize - scaledW) / 2f, (inputSize - scaledH) / 2f, null)
+        return letterboxed
     }
 
     private fun fillInputBuffer(bitmap: Bitmap) {
