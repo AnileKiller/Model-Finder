@@ -15,15 +15,22 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 
 /**
- * Wraps the FaceMesh lite TFLite model to extract 468 facial landmarks.
+ * Wraps the MediaPipe Face Landmark with Attention TFLite model to extract
+ * 468 facial landmarks.
  *
- * Model:  facemesh_lite_468_2022_09_06.f16.tflite
+ * Model:  face_landmark_with_attention.tflite
  * Input:  [1, 192, 192, 3] — normalised float RGB in [0, 1]
  * Output:
  *   - landmarks  [1, 1, 1, 1404]  (468 × 3 values: x, y, z in [0, 192])
- *   - score      [1, 1, 1, 1]     (face presence confidence)
+ *   - score      [1, 1, 1, 1]     (face presence confidence logit)
  *
- * Landmarks are returned in normalised [0,1] image coordinates.
+ * Compared to the lite model this version uses a self-attention mechanism
+ * that produces significantly more accurate landmark positions around the
+ * eyes, eyebrows, and lips — the exact regions used for exclusion-zone
+ * punching. The I/O tensor shapes and coordinate space are identical.
+ *
+ * Landmarks are returned in normalised [0,1] image coordinates relative
+ * to the original source bitmap.
  */
 class FaceMeshDetector(context: Context) : AutoCloseable {
 
@@ -156,7 +163,7 @@ class FaceMeshDetector(context: Context) : AutoCloseable {
     }
 
     companion object {
-        private const val MODEL_FILE = "models/facemesh_lite_468_2022_09_06.f16.tflite"
+        private const val MODEL_FILE = "models/face_landmark_with_attention.tflite"
         private const val FLOAT_BYTES = 4
 
         private fun loadModelFile(context: Context, filename: String): MappedByteBuffer {
