@@ -2,6 +2,7 @@ package com.beautyai.prototype.data.inference
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.RectF
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -65,25 +66,50 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
     }
 
     /**
-     * Runs segmentation on [bitmap]. [faceBox] is currently unused (the model
-     * segments the whole frame) but kept for API compatibility with callers
-     * and potential future face-region cropping.
+     * Runs segmentation on [bitmap] and returns a 2D array sized
+     * [bitmap.height][bitmap.width] with per-pixel face-skin probability in [0,1].
      *
-     * Returns a 2D array sized [bitmap.height][bitmap.width] with per-pixel
-     * face-skin probability in [0, 1].
+     * The full image is letterboxed (aspect-ratio-preserving black padding) to
+     * 256×256 before inference. The inverse letterbox transform is applied during
+     * upsampling so each output pixel maps back to the correct position in the
+     * original image. Without this, squishing a non-square image to 256×256 shifts
+     * the mask boundary in a direction that depends on the photo's aspect ratio,
+     * causing it to misalign with the landmarks produced by FaceMesh.
      */
     fun segment(bitmap: Bitmap, faceBox: RectF): Array<FloatArray> {
-        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        fillInputBuffer(scaled)
+        val imgW  = bitmap.width.toFloat()
+        val imgH  = bitmap.height.toFloat()
+
+        // Uniform scale that fits the full image inside inputSize×inputSize
+        val scale  = minOf(inputSize / imgW, inputSize / imgH)
+        val scaledW = (imgW * scale).toInt().coerceAtLeast(1)
+        val scaledH = (imgH * scale).toInt().coerceAtLeast(1)
+        val padX   = (inputSize - scaledW) / 2f
+        val padY   = (inputSize - scaledH) / 2f
+
+        fillInputBuffer(letterboxBitmap(bitmap, scaledW, scaledH))
 
         inputBuffer.rewind()
         outputBuffer.rewind()
         interpreter.run(inputBuffer, outputBuffer)
 
-        return upsampleMask(outputBuffer, bitmap.width, bitmap.height)
+        return upsampleMask(outputBuffer, bitmap.width, bitmap.height, padX, padY, scale)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Scales [src] to [scaledW]×[scaledH] (aspect-ratio-preserving) and centres
+     * it on a black [inputSize]×[inputSize] canvas — matching the letterbox
+     * approach used in BlazeFaceDetector and FaceMeshDetector.
+     */
+    private fun letterboxBitmap(src: Bitmap, scaledW: Int, scaledH: Int): Bitmap {
+        val scaled      = Bitmap.createScaledBitmap(src, scaledW, scaledH, true)
+        val letterboxed = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+        val canvas      = Canvas(letterboxed)
+        canvas.drawBitmap(scaled, (inputSize - scaledW) / 2f, (inputSize - scaledH) / 2f, null)
+        return letterboxed
+    }
 
     private fun fillInputBuffer(bitmap: Bitmap) {
         inputBuffer.rewind()
@@ -97,10 +123,29 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
     }
 
     /**
-     * Extracts the face-skin channel ([FACE_SKIN_CLASS_INDEX]) from the
-     * multi-class output and bilinearly upsamples it to [targetW]×[targetH].
+     * Extracts the face-skin channel ([FACE_SKIN_CLASS_INDEX]) from the raw
+     * multi-class output and bilinearly resamples it to [targetW]×[targetH].
+     *
+     * Each target pixel (x, y) is mapped to its corresponding position inside
+     * the 256×256 letterboxed model output using the same [scale], [padX], and
+     * [padY] that were used when building the letterboxed input:
+     *
+     *   srcX = x × scale + padX
+     *   srcY = y × scale + padY
+     *
+     * Pixels that land inside the padding bars (outside the actual image region)
+     * produce a srcX/srcY outside the content area; bilinear sampling clamps them
+     * to the nearest valid content pixel, which is always a near-zero background
+     * value — correctly yielding a 0.0 mask value at the image borders.
      */
-    private fun upsampleMask(raw: ByteBuffer, targetW: Int, targetH: Int): Array<FloatArray> {
+    private fun upsampleMask(
+        raw: ByteBuffer,
+        targetW: Int,
+        targetH: Int,
+        padX: Float,
+        padY: Float,
+        scale: Float
+    ): Array<FloatArray> {
         raw.rewind()
         val flatMask = FloatArray(inputSize * inputSize)
         for (i in 0 until inputSize * inputSize) {
@@ -113,19 +158,19 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
         }
 
         val result = Array(targetH) { FloatArray(targetW) }
-        val scaleX = inputSize.toFloat() / targetW
-        val scaleY = inputSize.toFloat() / targetH
 
         for (y in 0 until targetH) {
             for (x in 0 until targetW) {
-                val srcX = x * scaleX
-                val srcY = y * scaleY
-                val x0   = srcX.toInt().coerceIn(0, inputSize - 1)
-                val y0   = srcY.toInt().coerceIn(0, inputSize - 1)
-                val x1   = (x0 + 1).coerceIn(0, inputSize - 1)
-                val y1   = (y0 + 1).coerceIn(0, inputSize - 1)
-                val dx   = srcX - x0
-                val dy   = srcY - y0
+                // Map original-image pixel → position in the letterboxed 256×256 output
+                val srcX = x * scale + padX
+                val srcY = y * scale + padY
+
+                val x0 = srcX.toInt().coerceIn(0, inputSize - 1)
+                val y0 = srcY.toInt().coerceIn(0, inputSize - 1)
+                val x1 = (x0 + 1).coerceIn(0, inputSize - 1)
+                val y1 = (y0 + 1).coerceIn(0, inputSize - 1)
+                val dx = srcX - x0
+                val dy = srcY - y0
 
                 result[y][x] =
                     flatMask[y0 * inputSize + x0] * (1 - dx) * (1 - dy) +
