@@ -600,63 +600,162 @@ class ApplyBeautyUseCase {
     // ── Debug overlay ────────────────────────────────────────────────────────
 
     /**
-     * Renders a colour-coded mask overlay on top of [source] for debugging.
+     * Renders a detailed colour-coded feature overlay for debugging.
      *
-     *  • **Green** (semi-transparent) — pixels inside the active skin zone that
-     *    beauty effects will touch.
-     *  • **Red** (semi-transparent) — pixels that were inside the raw segmentation
-     *    mask but have been punched out as exclusion zones (eyes, eyebrows, lips,
-     *    nostrils).
-     *  • **No tint** — background / non-face pixels that are always skipped.
-     *
-     * Call this instead of [invoke] when the debug toggle is on.
+     * Layer order (bottom → top):
+     *  1. **Green tint** — pixels inside the active skin zone the beauty pipeline touches.
+     *  2. **Coloured filled polygons** — one colour per facial feature group, drawn
+     *     using the 468 FaceMesh landmarks so each region is geometrically accurate:
+     *       • Face oval  — white stroke (no fill)
+     *       • Nose bridge  — light blue fill
+     *       • Nose base/nostrils — purple fill
+     *       • Lips outer — hot-pink fill
+     *       • Mouth interior/teeth — yellow fill
+     *       • Eyebrows — orange fill
+     *       • Eyes — cyan fill
+     *  3. **White dots** — all 468 landmark positions.
+     *  4. **Legend panel** — colour key in the top-left corner.
      */
     fun renderMaskDebugOverlay(source: Bitmap, faceData: FaceData): Bitmap {
-        val w = source.width
-        val h = source.height
-        val baseMask    = faceData.segmentationMask
-        val refinedMask = punchExclusionZones(baseMask, faceData, w, h)
+        val w  = source.width
+        val h  = source.height
+        val lm = faceData.landmarks
 
-        val pixels = IntArray(w * h)
+        // ── 1. Skin mask: green tint per-pixel ───────────────────────────────
+        val refinedMask = punchExclusionZones(faceData.segmentationMask, faceData, w, h)
+        val pixels      = IntArray(w * h)
         source.getPixels(pixels, 0, w, 0, 0, w, h)
-
         for (y in 0 until h) {
             for (x in 0 until w) {
-                val idx      = y * w + x
-                val baseVal  = baseMask[y][x]
-                val refined  = refinedMask[y][x]
-                val p        = pixels[idx]
-                val a        = p ushr 24
-                val r        = p shr 16 and 0xFF
-                val g        = p shr 8  and 0xFF
-                val b        = p        and 0xFF
-
-                pixels[idx] = when {
-                    // Active skin zone — tint green
-                    refined >= MASK_THRESHOLD -> {
-                        val tintAlpha = (refined * 0.45f).coerceIn(0f, 1f)
-                        val nr = (r + (0   - r) * tintAlpha).toInt().coerceIn(0, 255)
-                        val ng = (g + (200 - g) * tintAlpha).toInt().coerceIn(0, 255)
-                        val nb = (b + (80  - b) * tintAlpha).toInt().coerceIn(0, 255)
-                        (a shl 24) or (nr shl 16) or (ng shl 8) or nb
-                    }
-                    // Punched-out exclusion zone — tint red
-                    baseVal >= MASK_THRESHOLD -> {
-                        val tintAlpha = (baseVal * 0.50f).coerceIn(0f, 1f)
-                        val nr = (r + (220 - r) * tintAlpha).toInt().coerceIn(0, 255)
-                        val ng = (g + (0   - g) * tintAlpha).toInt().coerceIn(0, 255)
-                        val nb = (b + (60  - b) * tintAlpha).toInt().coerceIn(0, 255)
-                        (a shl 24) or (nr shl 16) or (ng shl 8) or nb
-                    }
-                    // Background — pass through unchanged
-                    else -> p
+                val idx     = y * w + x
+                val refined = refinedMask[y][x]
+                val p       = pixels[idx]
+                if (refined >= MASK_THRESHOLD) {
+                    val t  = (refined * 0.35f).coerceIn(0f, 1f)
+                    val a  = p ushr 24
+                    val r  = p shr 16 and 0xFF
+                    val g  = p shr 8  and 0xFF
+                    val b  = p        and 0xFF
+                    pixels[idx] = (a shl 24) or
+                        ((r + (0   - r) * t).toInt().coerceIn(0, 255) shl 16) or
+                        ((g + (200 - g) * t).toInt().coerceIn(0, 255) shl 8)  or
+                         (b + (80  - b) * t).toInt().coerceIn(0, 255)
                 }
             }
         }
-
         val out = source.copy(Bitmap.Config.ARGB_8888, true)
         out.setPixels(pixels, 0, w, 0, 0, w, h)
+
+        if (lm.size < 468) return out
+
+        // ── 2. Feature polygons via Canvas ───────────────────────────────────
+        val canvas = Canvas(out)
+
+        fun landmarkPath(indices: List<Int>): Path {
+            val path = Path()
+            path.moveTo(lm[indices[0]].x * w, lm[indices[0]].y * h)
+            for (i in 1 until indices.size) path.lineTo(lm[indices[i]].x * w, lm[indices[i]].y * h)
+            path.close()
+            return path
+        }
+
+        fun fillPaint(r: Int, g: Int, b: Int, alpha: Int = 130) = Paint().apply {
+            color = Color.argb(alpha, r, g, b)
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+
+        fun edgePaint(r: Int, g: Int, b: Int, sw: Float = 2.5f, alpha: Int = 230) = Paint().apply {
+            color = Color.argb(alpha, r, g, b)
+            style = Paint.Style.STROKE
+            strokeWidth = sw
+            isAntiAlias = true
+        }
+
+        // Face oval — white stroke, no fill (so skin tint shows through)
+        canvas.drawPath(landmarkPath(FEATURE_FACE_OVAL),
+            edgePaint(255, 255, 255, 1.5f, 140))
+
+        // Nose bridge — light blue
+        canvas.drawPath(landmarkPath(FEATURE_NOSE_BRIDGE), fillPaint(100, 181, 246, 140))
+        canvas.drawPath(landmarkPath(FEATURE_NOSE_BRIDGE), edgePaint(130, 200, 255, 2f, 210))
+
+        // Nose base / nostrils — purple
+        canvas.drawPath(landmarkPath(FEATURE_NOSE_BASE), fillPaint(186, 104, 200, 140))
+        canvas.drawPath(landmarkPath(FEATURE_NOSE_BASE), edgePaint(220, 150, 235, 2f, 220))
+
+        // Outer lips — hot pink
+        canvas.drawPath(landmarkPath(FEATURE_LIPS_OUTER), fillPaint(233, 30, 99, 140))
+        canvas.drawPath(landmarkPath(FEATURE_LIPS_OUTER), edgePaint(255, 80, 130, 2.5f, 235))
+
+        // Inner mouth / teeth — golden yellow (inner polygon drawn on top of lips fill)
+        canvas.drawPath(landmarkPath(FEATURE_LIPS_INNER), fillPaint(255, 235, 59, 165))
+        canvas.drawPath(landmarkPath(FEATURE_LIPS_INNER), edgePaint(255, 248, 110, 1.5f, 235))
+
+        // Eyebrows — deep orange
+        canvas.drawPath(landmarkPath(FEATURE_LEFT_BROW),  fillPaint(255, 152, 0, 150))
+        canvas.drawPath(landmarkPath(FEATURE_RIGHT_BROW), fillPaint(255, 152, 0, 150))
+        canvas.drawPath(landmarkPath(FEATURE_LEFT_BROW),  edgePaint(255, 190, 50, 2f, 235))
+        canvas.drawPath(landmarkPath(FEATURE_RIGHT_BROW), edgePaint(255, 190, 50, 2f, 235))
+
+        // Eyes — cyan (drawn last so they sit on top of brow fills at the corner)
+        canvas.drawPath(landmarkPath(FEATURE_LEFT_EYE),  fillPaint(0, 200, 220, 155))
+        canvas.drawPath(landmarkPath(FEATURE_RIGHT_EYE), fillPaint(0, 200, 220, 155))
+        canvas.drawPath(landmarkPath(FEATURE_LEFT_EYE),  edgePaint(0, 240, 255, 2.5f, 245))
+        canvas.drawPath(landmarkPath(FEATURE_RIGHT_EYE), edgePaint(0, 240, 255, 2.5f, 245))
+
+        // ── 3. All 468 landmark dots ─────────────────────────────────────────
+        val dotPaint  = Paint().apply {
+            color = Color.argb(210, 255, 255, 255)
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+        val dotR = (w * 0.0025f).coerceIn(1.5f, 4f)
+        for (l in lm) canvas.drawCircle(l.x * w, l.y * h, dotR, dotPaint)
+
+        // ── 4. Legend ────────────────────────────────────────────────────────
+        drawDebugLegend(canvas, w, h)
+
         return out
+    }
+
+    private fun drawDebugLegend(canvas: Canvas, imgW: Int, imgH: Int) {
+        val entries = listOf(
+            Color.argb(220, 0,   200, 80)  to "Skin (smoothed)",
+            Color.argb(220, 0,   200, 220) to "Eyes",
+            Color.argb(220, 255, 152, 0)   to "Eyebrows",
+            Color.argb(220, 233, 30,  99)  to "Lips",
+            Color.argb(220, 255, 235, 59)  to "Mouth / teeth",
+            Color.argb(220, 186, 104, 200) to "Nose base",
+            Color.argb(220, 100, 181, 246) to "Nose bridge",
+        )
+        val pad    = imgW * 0.022f
+        val boxSz  = imgW * 0.028f
+        val textSz = imgW * 0.022f
+        val lineH  = boxSz * 1.6f
+        val panelW = imgW * 0.44f
+        val panelH = pad + entries.size * lineH + pad * 0.6f
+
+        // Dark semi-transparent background panel
+        val bgPaint = Paint().apply { color = Color.argb(178, 0, 0, 0); isAntiAlias = true }
+        canvas.drawRoundRect(
+            RectF(pad * 0.4f, pad * 0.4f, pad * 0.4f + panelW, pad * 0.4f + panelH),
+            14f, 14f, bgPaint
+        )
+
+        val boxPaint  = Paint().apply { style = Paint.Style.FILL; isAntiAlias = true }
+        val textPaint = Paint().apply {
+            color     = Color.WHITE
+            textSize  = textSz
+            isAntiAlias = true
+        }
+
+        entries.forEachIndexed { i, (color, label) ->
+            val top = pad * 0.4f + pad + i * lineH
+            boxPaint.color = color
+            canvas.drawRoundRect(RectF(pad, top, pad + boxSz, top + boxSz), 4f, 4f, boxPaint)
+            canvas.drawText(label, pad + boxSz + pad * 0.5f, top + boxSz * 0.82f, textPaint)
+        }
     }
 
     // ── Exclusion zone helpers ────────────────────────────────────────────────
@@ -749,6 +848,36 @@ class ApplyBeautyUseCase {
     }
 
     companion object {
+        // ── Debug overlay: facial feature landmark index groups ───────────────
+        // All indices follow the canonical MediaPipe FaceMesh 468-point topology.
+
+        /** Outer face contour (36 points going clockwise from forehead). */
+        private val FEATURE_FACE_OVAL = listOf(
+            10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+            397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+            172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+        )
+        /** Left eye contour (16 points). */
+        private val FEATURE_LEFT_EYE  = listOf(33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246)
+        /** Right eye contour (16 points). */
+        private val FEATURE_RIGHT_EYE = listOf(362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398)
+        /** Left eyebrow (10 points). */
+        private val FEATURE_LEFT_BROW = listOf(70, 63, 105, 66, 107, 55, 65, 52, 53, 46)
+        /** Right eyebrow (10 points). */
+        private val FEATURE_RIGHT_BROW = listOf(300, 293, 334, 296, 336, 285, 295, 282, 283, 276)
+        /** Outer lip contour (20 points). */
+        private val FEATURE_LIPS_OUTER = listOf(61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185)
+        /** Inner lip / mouth-opening contour (20 points) — encloses the teeth area. */
+        private val FEATURE_LIPS_INNER = listOf(78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191)
+        /**
+         * Nose bridge: a thin diamond from the nasal bridge (168) down through
+         * left-side (44) and right-side (274) to the tip (4).  Gives the bridge
+         * region a visible width while staying tight to the nose centreline.
+         */
+        private val FEATURE_NOSE_BRIDGE = listOf(168, 44, 4, 274)
+        /** Nose base / nostril flare area (8 points). */
+        private val FEATURE_NOSE_BASE   = listOf(4, 45, 51, 5, 281, 275, 440, 220)
+
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.3f
         private const val MAX_BILATERAL_RADIUS      = 6       
