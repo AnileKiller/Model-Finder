@@ -32,9 +32,12 @@ import java.nio.channels.FileChannel
  * version. This model is fully public, float32 throughout, and designed to
  * run on the standard TFLite Android runtime.
  *
- * We extract the "face-skin" channel (index 3) as the beauty-retouch mask,
- * work at a fixed 256x256 resolution, then bilinearly scale it back up to
- * the source image size.
+ * We combine the "body-skin" (index 2) and "face-skin" (index 3) channels
+ * into a single skin mask — using the max of the two per-pixel confidences —
+ * so that the neck and any other visible body skin receive the exact same
+ * bilateral-blur beauty treatment as the face, instead of only the face
+ * proper. We work at a fixed 256x256 resolution, then bilinearly scale the
+ * combined mask back up to the source image size.
  *
  * Returns a 2D float array [height][width] with values in [0, 1].
  */
@@ -152,8 +155,11 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
     }
 
     /**
-     * Extracts the face-skin channel ([FACE_SKIN_CLASS_INDEX]) from the raw
-     * multi-class output and bilinearly resamples it to [targetW]×[targetH].
+     * Extracts and combines the body-skin ([BODY_SKIN_CLASS_INDEX]) and
+     * face-skin ([FACE_SKIN_CLASS_INDEX]) channels from the raw multi-class
+     * output — taking the per-pixel max of the two, since a pixel is skin if
+     * either class is confident — then bilinearly resamples the combined
+     * mask to [targetW]×[targetH].
      *
      * Each target pixel (x, y) is mapped to its corresponding position inside
      * the 256×256 letterboxed model output using the same [scale], [padX], and
@@ -178,12 +184,16 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
         raw.rewind()
         val flatMask = FloatArray(inputSize * inputSize)
         for (i in 0 until inputSize * inputSize) {
+            var bodySkinScore = 0f
             var faceSkinScore = 0f
             for (c in 0 until NUM_CLASSES) {
                 val value = raw.getFloat()
+                if (c == BODY_SKIN_CLASS_INDEX) bodySkinScore = value
                 if (c == FACE_SKIN_CLASS_INDEX) faceSkinScore = value
             }
-            flatMask[i] = faceSkinScore
+            // Combine body-skin (neck, shoulders, etc.) and face-skin into a
+            // single skin mask so the neck gets the same treatment as the face.
+            flatMask[i] = maxOf(bodySkinScore, faceSkinScore)
         }
 
         val result = Array(targetH) { FloatArray(targetW) }
@@ -223,6 +233,7 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
 
         // MediaPipe selfie_multiclass_256x256 class indices:
         // 0 = background, 1 = hair, 2 = body-skin, 3 = face-skin, 4 = clothes, 5 = other
+        private const val BODY_SKIN_CLASS_INDEX = 2
         private const val FACE_SKIN_CLASS_INDEX = 3
 
         private fun loadModelFile(context: Context, filename: String): MappedByteBuffer {
