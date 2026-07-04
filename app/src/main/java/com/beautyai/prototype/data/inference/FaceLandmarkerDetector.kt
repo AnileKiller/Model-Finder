@@ -8,6 +8,7 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.BaseOptions.Delegate
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
+import com.google.mediapipe.tasks.core.[span_1](start_span)Delegate
 
 /**
  * Wraps the MediaPipe Tasks [FaceLandmarker] to perform face detection and
