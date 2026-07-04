@@ -45,13 +45,19 @@ android {
         compose = true
     }
 
-    // Keep TFLite model files from being compressed in the APK so they can
-    // be loaded with MappedByteBuffer for zero-copy memory access.
+    // Keep model files uncompressed in the APK so they can be memory-mapped.
+    // "task" covers MediaPipe Tasks bundles; "tflite"/"lite" cover raw TFLite models.
     androidResources {
-        noCompress += listOf("tflite", "lite")
+        noCompress += listOf("tflite", "lite", "task")
     }
 
     packaging {
+        // libc++_shared.so is shipped by both the MediaPipe Tasks AAR and the
+        // TFLite GPU AAR. pickFirsts silences the "duplicate file" build error
+        // by keeping whichever version is resolved first (both are ABI-compatible).
+        jniLibs {
+            pickFirsts += listOf("**/libc++_shared.so")
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -89,6 +95,12 @@ dependencies {
     // transitively as an implementation dependency, which is NOT visible on our
     // compile classpath — it must be declared directly here.
     implementation(libs.tensorflow.lite.gpu.api)
+
+    // MediaPipe Tasks — provides FaceLandmarker which runs face detection +
+    // landmark extraction in a single call, and ships the custom C++ ops
+    // (e.g. Landmarks2TransformMatrix) that face_landmark_with_attention needs.
+    // These ops are NOT available in the standard TFLite runtime.
+    implementation(libs.mediapipe.tasks.vision)
 
     // Image loading
     implementation(libs.coil.compose)
