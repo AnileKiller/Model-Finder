@@ -37,11 +37,13 @@ fun MainScreen(
     beautyParams: BeautyParameters,
     isReprocessing: Boolean,
     showOriginal: Boolean,
+    showMaskOverlay: Boolean,
     saveSuccess: String?,
     onSelectImage: () -> Unit,
     onParamsChange: (BeautyParameters) -> Unit,
     onReset: () -> Unit,
     onToggleOriginal: () -> Unit,
+    onToggleMaskOverlay: () -> Unit,
     onSave: () -> Unit,
     onDismissSave: () -> Unit,
 ) {
@@ -135,6 +137,25 @@ fun MainScreen(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(if (showOriginal) "Show Enhanced" else "Compare Original")
+                }
+
+                // Mask overlay debug toggle — only shown when a face was detected
+                if (state.faceData != null) {
+                    OutlinedButton(
+                        onClick = onToggleMaskOverlay,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = if (showMaskOverlay)
+                            ButtonDefaults.outlinedButtonColors(
+                                containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                                contentColor   = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                        else
+                            ButtonDefaults.outlinedButtonColors()
+                    ) {
+                        Icon(Icons.Default.Layers, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(if (showMaskOverlay) "Hide Mask Overlay" else "Show Mask Overlay")
+                    }
                 }
 
                 // Beauty sliders
