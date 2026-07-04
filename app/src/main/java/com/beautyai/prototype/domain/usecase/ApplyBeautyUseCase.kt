@@ -44,11 +44,30 @@ class ApplyBeautyUseCase {
         if (effective.skinToneEnhancement > 0f)
             result = applySkinTone(result, blurredMask, effective.skinToneEnhancement)
 
-        if (effective.underEyeReduction > 0f)
-            result = applyUnderEyeReduction(result, faceData, effective.underEyeReduction)
+        // 1. MASK FEED FIX: three distinct, non-overlapping-in-purpose masks so
+        // each effect only ever samples the mask it geometrically needs —
+        // eliminates the mathematical collision where the eye-bag blur bled
+        // into the eyeball/lash line and the eye-brightness glow leaked onto
+        // the whole eye socket instead of just the iris.
+        if (effective.underEyeReduction > 0f) {
+            val eyesMask = createFeatureMask(
+                faceData, listOf(LEFT_EYE_INDICES, RIGHT_EYE_INDICES),
+                source.width, source.height, EYES_BLUR_RADIUS
+            )
+            val eyeBagsMask = createFeatureMask(
+                faceData, listOf(LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES),
+                source.width, source.height, EYE_BAG_BLUR_RADIUS
+            )
+            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, effective.underEyeReduction)
+        }
 
-        if (effective.eyeBrightness > 0f)
-            result = applyEyeBrightness(result, faceData, effective.eyeBrightness)
+        if (effective.eyeBrightness > 0f) {
+            val irisMask = createFeatureMask(
+                faceData, listOf(LEFT_IRIS_INDICES, RIGHT_IRIS_INDICES),
+                source.width, source.height, IRIS_BLUR_RADIUS
+            )
+            result = applyEyeBrightness(result, faceData, irisMask, effective.eyeBrightness)
+        }
 
         if (effective.teethWhitening > 0f)
             result = applyTeethWhitening(result, faceData, effective.teethWhitening)
@@ -263,26 +282,24 @@ class ApplyBeautyUseCase {
 
 
     /**
-     * 2. REWRITE: The old implementation approximated eye-bag geometry with an
-     * expanded RectF plus a radial (elliptical) feather, which is a poor fit
-     * for the actual crescent shape of the tear trough / lower orbital area
-     * and often bled onto the cheekbone. This version instead builds an exact
-     * crescent mask from the canonical MediaPipe eye-bag contour indices via
-     * [createFeatureMask] (feathered with a 10f blur for a soft, natural
-     * edge) and uses that mask — not geometric distance — to gate the
-     * shadow-reduction shader.
+     * 2. STUDIO LIGHTING & BLEED FIX: [bagsMask] is fed with a heavy 12f blur
+     * so the crescent shape reads as a soft shadow rather than a hard cutout,
+     * but that same heavy blur bleeds the mask past the lash line and onto
+     * the eyeball itself. Subtracting the tightly-feathered [eyesMask] (2f
+     * blur) from [bagsMask] carves the eye contour back out, so the effect
+     * only ever touches actual under-eye skin. The luminance gate is also
+     * shifted up (110f–190f) so the effect responds correctly to bright
+     * studio lighting instead of only the darkest shadow pixels.
      */
-    private fun applyUnderEyeReduction(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    private fun applyUnderEyeReduction(
+        src: Bitmap,
+        bagsMask: Array<FloatArray>,
+        eyesMask: Array<FloatArray>,
+        strength: Float
+    ): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        val eyeBagsMask = createFeatureMask(
-            face,
-            listOf(LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES),
-            w, h,
-            EYE_BAG_BLUR_RADIUS
-        )
 
         // Lowered the global max lift slightly so it doesn't wash out
         val liftAmount = (strength * MAX_UNDER_EYE_LIFT).toInt().coerceIn(0, 255)
@@ -295,17 +312,19 @@ class ApplyBeautyUseCase {
 
         for (y in 0 until h) {
             for (x in 0 until w) {
-                val maskVal = eyeBagsMask[y][x]
+                // MASK SUBTRACTION: remove the eye contour from the (heavily
+                // blurred) bag mask so the effect can't bleed onto the lash line.
+                val maskVal = (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f)
                 if (maskVal < MASK_THRESHOLD) continue
 
                 val idx = y * w + x
                 val p = pixels[idx]
                 val luminance = luma(p)
 
-                // LUMINANCE GATING: Target ONLY the dark shadows.
-                // If luminance < 70 (dark shadow), shadowLikeness is 1.0 (Full effect).
-                // If luminance > 140 (bright cheekbone), shadowLikeness is 0.0 (No effect).
-                val shadowLikeness = 1f - smoothstep(70f, 140f, luminance)
+                // LUMINANCE GATING shifted for bright studio lighting: targets
+                // moderate-to-bright shadow zones instead of only extreme dark
+                // shadows, which previously missed shadows lit by studio setups.
+                val shadowLikeness = 1f - smoothstep(110f, 190f, luminance)
 
                 // Skip pixels that are already bright to prevent the white "stroke" effect
                 if (shadowLikeness <= 0f) continue
@@ -315,7 +334,7 @@ class ApplyBeautyUseCase {
                 val g = screen(p shr 8  and 0xFF, liftAmount)
                 val b = screen(p        and 0xFF, bLift)
 
-                // Combine user strength, the feathered crescent mask, and shadow targeting
+                // Combine user strength, the subtracted crescent mask, and shadow targeting
                 val finalAlpha = strength * maskVal * shadowLikeness
 
                 pixels[idx] = blendPixel(p, (a shl 24) or (r shl 16) or (g shl 8) or b, finalAlpha)
@@ -326,23 +345,19 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    private fun applyEyeBrightness(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    /**
+     * 1. IRIS & PUPIL DISTINGUISHING: [irisMask] is a feathered alpha mask
+     * built from the canonical MediaPipe iris landmarks (passed in from
+     * [invoke]) so the "sparkle" brightening is concentrated on the
+     * iris/pupil itself rather than the whole eye socket — otherwise the
+     * whole eyeball glows instead of just the pupil.
+     */
+    private fun applyEyeBrightness(src: Bitmap, face: FaceData, irisMask: Array<FloatArray>, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val pixels = IntArray(w * h)
         result.getPixels(pixels, 0, w, 0, 0, w, h)
         val liftAmount = (strength * MAX_EYE_LIFT).toInt().coerceIn(0, 255)
-
-        // 1. IRIS & PUPIL DISTINGUISHING: build a feathered alpha mask from the
-        // canonical MediaPipe iris landmarks so the "sparkle" brightening is
-        // concentrated on the iris/pupil itself rather than the whole eye
-        // socket (which previously washed out the sclera and lash line too).
-        val irisMask = createFeatureMask(
-            face,
-            listOf(LEFT_IRIS_INDICES, RIGHT_IRIS_INDICES),
-            w, h,
-            IRIS_BLUR_RADIUS
-        )
 
         listOf(face.leftEyeRect(w, h), face.rightEyeRect(w, h)).forEach { rect ->
             for (y in rect.top.toInt().coerceAtLeast(0) until rect.bottom.toInt().coerceAtMost(h)) {
@@ -743,6 +758,22 @@ class ApplyBeautyUseCase {
         canvas.drawPath(landmarkPath(FEATURE_LEFT_EYE),  edgePaint(0, 240, 255, 2.5f, 245))
         canvas.drawPath(landmarkPath(FEATURE_RIGHT_EYE), edgePaint(0, 240, 255, 2.5f, 245))
 
+        // Eye bags — light pink/magenta, low alpha so the skin tint underneath
+        // stays visible (drawn before the iris so the pupil sits on top).
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES),  fillPaint(255, 105, 180, 90))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_INDICES), fillPaint(255, 105, 180, 90))
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES),  edgePaint(255, 20, 147, 1.5f, 190))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_INDICES), edgePaint(255, 20, 147, 1.5f, 190))
+
+        // Pupils / iris — cyan/white (needs the 478-point mesh with iris
+        // refinement landmarks 468-477; skipped if unavailable).
+        if (lm.size >= 478) {
+            canvas.drawPath(landmarkPath(LEFT_IRIS_INDICES),  fillPaint(255, 255, 255, 210))
+            canvas.drawPath(landmarkPath(RIGHT_IRIS_INDICES), fillPaint(255, 255, 255, 210))
+            canvas.drawPath(landmarkPath(LEFT_IRIS_INDICES),  edgePaint(0, 240, 255, 1.5f, 245))
+            canvas.drawPath(landmarkPath(RIGHT_IRIS_INDICES), edgePaint(0, 240, 255, 1.5f, 245))
+        }
+
         // ── 3. All 468 landmark dots ─────────────────────────────────────────
         val dotPaint  = Paint().apply {
             color = Color.argb(210, 255, 255, 255)
@@ -762,6 +793,8 @@ class ApplyBeautyUseCase {
         val entries = listOf(
             Color.argb(220, 0,   200, 80)  to "Skin (smoothed)",
             Color.argb(220, 0,   200, 220) to "Eyes",
+            Color.argb(220, 255, 255, 255) to "Pupils",
+            Color.argb(220, 255, 20,  147) to "Eye Bags",
             Color.argb(220, 255, 152, 0)   to "Eyebrows",
             Color.argb(220, 233, 30,  99)  to "Lips",
             Color.argb(220, 255, 235, 59)  to "Mouth / teeth",
@@ -917,6 +950,14 @@ class ApplyBeautyUseCase {
         /** Nose base / nostril flare area (8 points). */
         private val FEATURE_NOSE_BASE   = listOf(4, 45, 51, 5, 281, 275, 440, 220)
 
+        // ── Eyes (canonical MediaPipe eye contour indices) — used only for
+        // mask subtraction, to carve the eyeball/lash line back out of the
+        // heavily-blurred eye-bag mask.
+        /** Left eye contour (16 points). */
+        val LEFT_EYE_INDICES  = FEATURE_LEFT_EYE
+        /** Right eye contour (16 points). */
+        val RIGHT_EYE_INDICES = FEATURE_RIGHT_EYE
+
         // ── Iris & pupil (canonical MediaPipe iris refinement indices) ────────
         /** Left iris ring, including the center pupil point (468). */
         val LEFT_IRIS_INDICES  = listOf(468, 469, 470, 471, 472)
@@ -945,7 +986,8 @@ class ApplyBeautyUseCase {
 
         // Under-eye / eye-bag reduction
         private const val MAX_UNDER_EYE_LIFT        = 45f
-        private const val EYE_BAG_BLUR_RADIUS       = 10f
+        private const val EYE_BAG_BLUR_RADIUS       = 12f
+        private const val EYES_BLUR_RADIUS          = 2f
 
         // Blemish reduction
         private const val BLEMISH_BLUR_RADIUS       = 8
