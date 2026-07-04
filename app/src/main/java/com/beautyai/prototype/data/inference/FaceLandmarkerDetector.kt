@@ -6,10 +6,9 @@ import android.graphics.RectF
 import com.beautyai.prototype.domain.model.Landmark
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.core.BaseOptions.Delegate
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
-import com.google.mediapipe.tasks.core.[span_1](start_span)Delegate
-
+import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker.FaceLandmarkerOptions
 /**
  * Wraps the MediaPipe Tasks [FaceLandmarker] to perform face detection and
  * facial landmark extraction in a single call.
