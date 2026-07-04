@@ -204,27 +204,48 @@ class ApplyBeautyUseCase {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
-        val blurred = gaussianBlur(pixels, w, h, BLEMISH_BLUR_RADIUS)
+        
+        // I recommend lowering this radius in your companion object from 8 to 5. 
+        // A radius of 8 pulls colors from too far away, which causes color bleeding near edges.
+        val blurred = gaussianBlur(pixels, w, h, 5) 
+
+        // The maximum luma difference. If a pixel is darker than this, it's an eye/lip edge, not a blemish.
+        val MAX_BLEMISH_DIFFERENCE = 55f 
 
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
                 if (maskVal < MASK_THRESHOLD) continue
+                
                 val idx = y * w + x
                 val p = pixels[idx]
                 val bp = blurred[idx]
-                val pLuma = luma(p); val bLuma = luma(bp)
-                if (pLuma < bLuma - BLEMISH_DARK_THRESHOLD) {
-                    pixels[idx] = blendPixel(p, bp, maskVal * strength * 0.8f)
+                
+                val pLuma = luma(p)
+                val bLuma = luma(bp)
+                val diff = bLuma - pLuma
+                
+                // 1. Check if it falls inside the "Blemish Zone" (Darker than skin, but not as dark as an eye)
+                if (diff > BLEMISH_DARK_THRESHOLD && diff < MAX_BLEMISH_DIFFERENCE) {
+                    
+                    // 2. Taper the effect near the limits to prevent harsh pixelated cutoffs
+                    val edgeProtection = 1f - smoothstep(MAX_BLEMISH_DIFFERENCE - 15f, MAX_BLEMISH_DIFFERENCE, diff)
+                    
+                    // Apply the fix, respecting the mask, user strength, and edge protection
+                    val finalAlpha = maskVal * strength * 0.8f * edgeProtection
+                    
+                    pixels[idx] = blendPixel(p, bp, finalAlpha)
                 }
             }
         }
+        
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         result.setPixels(pixels, 0, w, 0, 0, w, h)
         return result
     }
 
-        private fun applyUnderEyeReduction(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+
+    private fun applyUnderEyeReduction(src: Bitmap, face: FaceData, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val pixels = IntArray(w * h)
