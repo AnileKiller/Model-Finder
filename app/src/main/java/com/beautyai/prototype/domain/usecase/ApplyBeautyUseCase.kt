@@ -69,8 +69,13 @@ class ApplyBeautyUseCase {
             result = applyEyeBrightness(result, faceData, irisMask, effective.eyeBrightness)
         }
 
-        if (effective.teethWhitening > 0f)
-            result = applyTeethWhitening(result, faceData, effective.teethWhitening)
+        if (effective.teethWhitening > 0f) {
+            val teethMask = createFeatureMask(
+                faceData, listOf(FEATURE_LIPS_INNER),
+                source.width, source.height, 4f
+            )
+            result = applyTeethWhitening(result, faceData, teethMask, effective.teethWhitening)
+        }
 
         return result
     }
@@ -241,9 +246,9 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // I recommend lowering this radius in your companion object from 8 to 5. 
-        // A radius of 8 pulls colors from too far away, which causes color bleeding near edges.
-        val blurred = gaussianBlur(pixels, w, h, 5) 
+        // 2. Wider blur radius (BLEMISH_BLUR_RADIUS = 8) isolates large acne
+        // spots far more reliably than a tight 5px radius.
+        val blurred = gaussianBlur(pixels, w, h, BLEMISH_BLUR_RADIUS) 
 
         // The maximum luma difference. If a pixel is darker than this, it's an eye/lip edge, not a blemish.
         val MAX_BLEMISH_DIFFERENCE = 55f 
@@ -315,16 +320,21 @@ class ApplyBeautyUseCase {
                 // MASK SUBTRACTION: remove the eye contour from the (heavily
                 // blurred) bag mask so the effect can't bleed onto the lash line.
                 val maskVal = (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f)
-                if (maskVal < MASK_THRESHOLD) continue
+                // 3. MASK DILUTION FIX: the 30f blur spreads the mask thin at
+                // the edges, so a strict MASK_THRESHOLD discarded most of the
+                // crescent. Allow any non-zero blurred edge through instead.
+                if (maskVal <= 0.01f) continue
+
+                // Re-boost the diluted mask value before using it downstream.
+                val boostedMask = (maskVal * 1.5f).coerceIn(0f, 1f)
 
                 val idx = y * w + x
                 val p = pixels[idx]
                 val luminance = luma(p)
 
-                // DYNAMIC LUMINANCE GATE: widened to 40f–160f so the effect
-                // catches both deep, dark shadows (large/low-hanging bags)
-                // and brighter studio-lit shadows in the same pass.
-                val shadowLikeness = 1f - smoothstep(40f, 160f, luminance)
+                // LUMINANCE GATE shifted higher (130f-210f) so the effect
+                // doesn't fade out on natural, richer-skin-tone shadows.
+                val shadowLikeness = 1f - smoothstep(130f, 210f, luminance)
 
                 // Skip pixels that are already bright to prevent the white "stroke" effect
                 if (shadowLikeness <= 0f) continue
@@ -334,8 +344,8 @@ class ApplyBeautyUseCase {
                 val g = screen(p shr 8  and 0xFF, liftAmount)
                 val b = screen(p        and 0xFF, bLift)
 
-                // Combine user strength, the subtracted crescent mask, and shadow targeting
-                val finalAlpha = strength * maskVal * shadowLikeness
+                // Combine user strength, the boosted crescent mask, and shadow targeting
+                val finalAlpha = strength * boostedMask * shadowLikeness
 
                 pixels[idx] = blendPixel(p, (a shl 24) or (r shl 16) or (g shl 8) or b, finalAlpha)
             }
@@ -387,7 +397,15 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    private fun applyTeethWhitening(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    /**
+     * 1. MIGRATED TO GEOMETRIC MASK: previously relied on [ellipseFeather]
+     * over the whole mouth bounding box, which faded out real teeth near the
+     * rect edges and let the effect leak onto lips/gums whenever the mouth
+     * wasn't perfectly centered in its rect. Now gated by [teethMask] — a
+     * feathered mask built directly from the inner-lip contour — so the
+     * effect only ever touches the actual mouth opening.
+     */
+    private fun applyTeethWhitening(src: Bitmap, face: FaceData, teethMask: Array<FloatArray>, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val pixels = IntArray(w * h)
@@ -399,6 +417,9 @@ class ApplyBeautyUseCase {
 
         for (y in mouthRect.top.toInt().coerceAtLeast(0) until mouthRect.bottom.toInt().coerceAtMost(h - 1)) {
             for (x in mouthRect.left.toInt().coerceAtLeast(0) until mouthRect.right.toInt().coerceAtMost(w - 1)) {
+                val maskVal = teethMask[y][x]
+                if (maskVal <= 0f) continue
+
                 val idx = y * w + x
                 val p = pixels[idx]
                 val a = p ushr 24
@@ -435,9 +456,7 @@ class ApplyBeautyUseCase {
                         (screen(ng, liftAmount) shl 8) or
                         screen(nb, liftAmount)
 
-                val feather = ellipseFeather(mouthRect, x, y)
-
-                pixels[idx] = blendPixel(p, lifted, strength * feather * teethLikeness)
+                pixels[idx] = blendPixel(p, lifted, strength * maskVal * teethLikeness)
             }
         }
         result.setPixels(pixels, 0, w, 0, 0, w, h)
@@ -995,13 +1014,13 @@ class ApplyBeautyUseCase {
         private const val IRIS_BLUR_RADIUS          = 4f
 
         // Under-eye / eye-bag reduction
-        private const val MAX_UNDER_EYE_LIFT        = 45f
+        private const val MAX_UNDER_EYE_LIFT        = 70f
         private const val EYE_BAG_BLUR_RADIUS       = 30f
         private const val EYES_BLUR_RADIUS          = 2f
 
         // Blemish reduction
         private const val BLEMISH_BLUR_RADIUS       = 8
-        private const val BLEMISH_DARK_THRESHOLD    = 20f
+        private const val BLEMISH_DARK_THRESHOLD    = 6f
 
         // Sharpening
         private const val SHARPEN_BLUR_RADIUS       = 2
