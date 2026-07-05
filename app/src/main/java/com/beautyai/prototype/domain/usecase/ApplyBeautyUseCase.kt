@@ -395,13 +395,12 @@ class ApplyBeautyUseCase {
             lumaCap = 255f
         }
 
-        val liftAmount = (strength * MAX_UNDER_EYE_LIFT).toInt().coerceIn(0, 255)
-        val rLift = (liftAmount * 1.15f).toInt().coerceIn(0, 255)
-        val bLift = (liftAmount * 0.85f).toInt().coerceIn(0, 255)
+        // Max raw brightness to add (0 to 100 scale)
+        val maxLift = strength * 100f
 
         for (y in 0 until h) {
             for (x in 0 until w) {
-                // 2. Subtract the eye mask to create a sharp upper boundary at the lash line
+                // 2. Subtract the eye mask to protect the lash line
                 val rawMask = (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f)
                 if (rawMask <= 0.01f) continue
 
@@ -409,26 +408,22 @@ class ApplyBeautyUseCase {
                 val p = pixels[idx]
                 val currentLuma = luma(p)
 
+                // 3. Additive Brightness Lift
+                // How much room is left before we hit the absolute cap?
+                val availableLift = maxOf(0f, lumaCap - currentLuma)
+
+                // Throttle the requested lift by the mask intensity, but never exceed the cap
+                val actualLift = minOf(maxLift * rawMask, availableLift)
+
+                if (actualLift <= 0f) continue
+
                 val a = p ushr 24
-                val r = screen(p shr 16 and 0xFF, rLift)
-                val g = screen(p shr 8  and 0xFF, liftAmount)
-                val b = screen(p        and 0xFF, bLift)
-                val liftedPixel = (a shl 24) or (r shl 16) or (g shl 8) or b
-                val intendedLuma = luma(liftedPixel)
+                val r = ((p shr 16 and 0xFF) + actualLift).toInt().coerceIn(0, 255)
+                val g = ((p shr 8  and 0xFF) + actualLift).toInt().coerceIn(0, 255)
+                val b = ((p        and 0xFF) + actualLift).toInt().coerceIn(0, 255)
 
-                // 3. Throttle the lift if it exceeds the dynamic cap
-                var allowedRatio = 1f
-                if (intendedLuma > currentLuma) {
-                    val maxAvailableLift = maxOf(0f, lumaCap - currentLuma)
-                    val requestedLift = intendedLuma - currentLuma
-                    if (requestedLift > maxAvailableLift) {
-                        allowedRatio = maxAvailableLift / requestedLift
-                    }
-                }
-
-                // rawMask carries the 3-tier gradient intensity inherently
-                val finalAlpha = strength * rawMask * allowedRatio
-                pixels[idx] = blendPixel(p, liftedPixel, finalAlpha)
+                // Directly apply the lifted pixel (no complex blend needed because actualLift handles the gradient natively)
+                pixels[idx] = (a shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
