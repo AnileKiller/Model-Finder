@@ -246,12 +246,31 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 2. Wider blur radius (BLEMISH_BLUR_RADIUS = 8) isolates large acne
-        // spots far more reliably than a tight 5px radius.
-        val blurred = gaussianBlur(pixels, w, h, BLEMISH_BLUR_RADIUS) 
+        // 1. Blur radius scaled to image size — a fixed radius that worked on
+        // a small preview image was far too tight on a full-res photo.
+        val dynamicRadius = (w * 0.045f).toInt().coerceIn(BLEMISH_BLUR_RADIUS, 30)
+        val blurred = gaussianBlur(pixels, w, h, dynamicRadius)
 
-        // The maximum luma difference. If a pixel is darker than this, it's an eye/lip edge, not a blemish.
-        val MAX_BLEMISH_DIFFERENCE = 55f 
+        // 2. Second, wider reference blur used as the skin-tone baseline for
+        // detection AND as the healing target, so blemishes are replaced with
+        // real surrounding skin tone rather than a slightly-blurred version
+        // of themselves. The narrow blur is now only used to reject flat
+        // noise (i.e. confirm there's real local contrast, not just a
+        // gradual skin-tone gradient).
+        val blurredWide = gaussianBlur(pixels, w, h, (dynamicRadius * 3).coerceAtMost(60))
+
+        // 3. PIH (post-inflammatory hyperpigmentation / dark mark) detection
+        // needs a per-face redness baseline — compute the average R-G across
+        // masked skin pixels once, up front.
+        var skinRednessSum = 0f; var skinCount = 0
+        for (sy in 0 until h) for (sx in 0 until w) {
+            if (mask[sy][sx] >= MASK_THRESHOLD) {
+                val sp = pixels[sy * w + sx]
+                skinRednessSum += (sp shr 16 and 0xFF) - (sp shr 8 and 0xFF)
+                skinCount++
+            }
+        }
+        val avgSkinRedness = if (skinCount > 0) skinRednessSum / skinCount else 10f
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -260,14 +279,15 @@ class ApplyBeautyUseCase {
 
                 val idx = y * w + x
                 val p = pixels[idx]
-                val bp = blurred[idx]
 
                 val pLuma = luma(p)
-                val bLuma = luma(bp)
-                val diff = bLuma - pLuma
+                val diffWide   = luma(blurredWide[idx]) - pLuma   // skin baseline diff
+                val diffNarrow = luma(blurred[idx]) - pLuma        // local contrast diff
+                val diff = diffWide  // use wide reference for detection
 
                 // 1. Check if it falls inside the "Blemish Zone" (Darker than skin, but not as dark as an eye)
-                if (diff > BLEMISH_DARK_THRESHOLD && diff < MAX_BLEMISH_DIFFERENCE) {
+                // and confirm real local contrast (diffNarrow) agrees, not just a broad skin-tone gradient.
+                if (diffWide > BLEMISH_DARK_THRESHOLD && diffWide < MAX_BLEMISH_DIFFERENCE && diffNarrow > 2f) {
 
                     // 2. Taper the effect near the limits to prevent harsh pixelated cutoffs
                     val edgeProtection = 1f - smoothstep(MAX_BLEMISH_DIFFERENCE - 15f, MAX_BLEMISH_DIFFERENCE, diff)
@@ -275,7 +295,20 @@ class ApplyBeautyUseCase {
                     // Apply the fix, respecting the mask, user strength, and edge protection
                     val finalAlpha = maskVal * strength * 0.8f * edgeProtection
 
-                    pixels[idx] = blendPixel(p, bp, finalAlpha)
+                    pixels[idx] = blendPixel(p, blurredWide[idx], finalAlpha)
+                }
+
+                // 3. PIH (dark mark) detection: brown/dark marks that are
+                // darker than surrounding skin but not particularly red —
+                // the redness gate above would otherwise miss these.
+                val redness = ((p shr 16 and 0xFF) - (p shr 8 and 0xFF)).toFloat()
+                val relativeRedness = redness - avgSkinRedness
+                val isPIH = diffWide > 8f && diffWide < MAX_BLEMISH_DIFFERENCE &&
+                        diffNarrow > 2f && relativeRedness < -3f &&
+                        luma(p) in 35f..170f
+                if (isPIH) {
+                    val pihAlpha = maskVal * strength * 0.5f
+                    pixels[idx] = blendPixel(p, blurredWide[idx], pihAlpha)
                 }
             }
         }
@@ -1023,8 +1056,9 @@ class ApplyBeautyUseCase {
         private const val EYES_BLUR_RADIUS          = 2f
 
         // Blemish reduction
-        private const val BLEMISH_BLUR_RADIUS       = 8
-        private const val BLEMISH_DARK_THRESHOLD    = 6f
+        private const val BLEMISH_BLUR_RADIUS       = 8      // kept as fallback minimum only
+        private const val BLEMISH_DARK_THRESHOLD    = 6f     // unchanged
+        private const val MAX_BLEMISH_DIFFERENCE    = 55f    // move from local variable to companion
 
         // Sharpening
         private const val SHARPEN_BLUR_RADIUS       = 2
