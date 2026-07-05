@@ -192,8 +192,10 @@ class FaceSegmentationDetector(context: Context) : AutoCloseable {
                 if (c == FACE_SKIN_CLASS_INDEX) faceSkinScore = value
             }
             // Combine body-skin (neck, shoulders, etc.) and face-skin into a
-            // single skin mask so the neck gets the same treatment as the face.
-            flatMask[i] = maxOf(bodySkinScore, faceSkinScore)
+            // single skin mask so the neck gets the same treatment as the face,
+            // but at reduced strength so body-skin false positives (e.g. a
+            // hand) don't get full-strength treatment.
+            flatMask[i] = maxOf(faceSkinScore, bodySkinScore * 0.4f)
         }
 
         val result = Array(targetH) { FloatArray(targetW) }
