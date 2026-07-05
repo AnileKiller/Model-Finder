@@ -959,16 +959,26 @@ class ApplyBeautyUseCase {
         val RIGHT_EYE_INDICES = FEATURE_RIGHT_EYE
 
         // ── Iris & pupil (canonical MediaPipe iris refinement indices) ────────
-        /** Left iris ring, including the center pupil point (468). */
-        val LEFT_IRIS_INDICES  = listOf(468, 469, 470, 471, 472)
-        /** Right iris ring, including the center pupil point (473). */
-        val RIGHT_IRIS_INDICES = listOf(473, 474, 475, 476, 477)
+        // Perimeter-only (center pupil dot omitted): including the center
+        // point made path.close() fold inward into a star/bowtie shape
+        // instead of a clean round pupil.
+        /** Left iris ring — perimeter only: Right, Top, Left, Bottom. */
+        private val LEFT_IRIS_INDICES = listOf(469, 470, 471, 472)
+        /** Right iris ring — perimeter only: Right, Top, Left, Bottom. */
+        private val RIGHT_IRIS_INDICES = listOf(474, 475, 476, 477)
 
         // ── Eye bags (canonical MediaPipe crescent contour indices) ───────────
-        /** Left under-eye / tear-trough crescent contour. */
-        val LEFT_EYE_BAG_INDICES  = listOf(33, 7, 163, 144, 145, 153, 154, 155, 133, 243, 190, 56, 28, 27, 29, 30, 247, 130)
-        /** Right under-eye / tear-trough crescent contour. */
-        val RIGHT_EYE_BAG_INDICES = listOf(362, 382, 381, 380, 374, 373, 390, 249, 263, 467, 260, 259, 257, 258, 286, 414, 463, 359)
+        // Corrected Left Eye Bag (Lower lid outer->inner, then cheek inner->outer)
+        private val LEFT_EYE_BAG_INDICES = listOf(
+            33, 7, 163, 144, 145, 153, 154, 155, 133,
+            112, 26, 22, 23, 24, 110, 25, 226, 130
+        )
+
+        // Corrected Right Eye Bag (Lower lid inner->outer, then cheek outer->inner)
+        private val RIGHT_EYE_BAG_INDICES = listOf(
+            362, 382, 381, 380, 374, 373, 390, 249, 263,
+            359, 446, 255, 339, 254, 253, 252, 256, 341
+        )
 
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.3f
