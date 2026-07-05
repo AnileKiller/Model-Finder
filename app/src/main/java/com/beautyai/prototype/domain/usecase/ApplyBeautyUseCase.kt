@@ -75,7 +75,7 @@ class ApplyBeautyUseCase {
                 faceData, listOf(LEFT_EYE_INDICES, RIGHT_EYE_INDICES),
                 source.width, source.height, EYES_BLUR_RADIUS
             )
-            val eyeBagsMask = createTieredEyeBagsMask(faceData, source.width, source.height, 12f)
+            val eyeBagsMask = createTieredEyeBagsMask(faceData, source.width, source.height, 6f)
             result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, refinedMask, effective.underEyeReduction)
         }
 
