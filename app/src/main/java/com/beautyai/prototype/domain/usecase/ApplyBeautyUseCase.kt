@@ -264,10 +264,10 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // Healing target: local baseline skin tone.
-        // Radius reduced slightly to prevent flattening natural facial geometry.
-        val wideRadius = (w * 0.08f).toInt().coerceIn(15, 45)
-        val blurWide = gaussianBlur(pixels, w, h, wideRadius)
+        val narrowRadius = (w * 0.008f).toInt().coerceIn(2, 10)
+        val wideRadius   = (w * 0.05f).toInt().coerceIn(15, 45)
+        val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
+        val blurWide   = gaussianBlur(pixels, w, h, wideRadius)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -277,35 +277,32 @@ class ApplyBeautyUseCase {
                 val idx = y * w + x
                 val p = pixels[idx]
                 val target = blurWide[idx]
+                val narrow = blurNarrow[idx]
 
-                val pLuma = luma(p)
-                val targetLuma = luma(target)
+                val targetLuma = maxOf(luma(target), 5f)
+                val narrowLuma = luma(narrow)
 
-                // 1. Detect High-Contrast Spots (both dark spots AND bright whiteheads)
-                val lumaDiff = kotlin.math.abs(targetLuma - pLuma)
-                // smoothstep creates a seamless gradient, eliminating harsh jagged edges
-                val contrastLikeness = smoothstep(4f, 18f, lumaDiff)
+                // 1. Relative Contrast Ratio (Crucial for dark skin tones)
+                val contrastRatio = kotlin.math.abs(narrowLuma - targetLuma) / targetLuma
+                // Triggers if contrast deviates by 4% to 15% from local skin
+                val contrastLikeness = smoothstep(0.04f, 0.15f, contrastRatio)
 
-                // 2. Detect Red Spots (active acne, inflammation)
-                val pRedness = (p shr 16 and 0xFF) - (p shr 8 and 0xFF).toFloat()
-                val targetRedness = (target shr 16 and 0xFF) - (target shr 8 and 0xFF).toFloat()
-                val redDiff = pRedness - targetRedness
-                val redLikeness = smoothstep(6f, 22f, redDiff)
+                // 2. Relative Redness (Active acne)
+                val nR = narrow shr 16 and 0xFF; val nG = narrow shr 8 and 0xFF
+                val tR = target shr 16 and 0xFF; val tG = target shr 8 and 0xFF
+                val redLikeness = smoothstep(4f, 15f, (nR - nG.toFloat()) - (tR - tG.toFloat()))
 
-                // Combine detections smoothly (No boolean cliffs!)
                 val blemishLikeness = maxOf(contrastLikeness, redLikeness)
 
-                // Protect structural facial edges (jawline, nostrils) and massive specular highlights
-                val edgeProtection = 1f - smoothstep(35f, 60f, lumaDiff)
+                // Protect massive shadows/edges (nostrils, jawline gaps)
+                val edgeProtection = 1f - smoothstep(0.25f, 0.45f, contrastRatio)
 
                 val finalAlpha = blemishLikeness * edgeProtection * maskVal * strength
-
                 if (finalAlpha <= 0.01f) continue
 
                 pixels[idx] = blendPixel(p, target, finalAlpha)
             }
         }
-
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         result.setPixels(pixels, 0, w, 0, 0, w, h)
         return result
@@ -884,11 +881,14 @@ class ApplyBeautyUseCase {
         canvas.drawPath(landmarkPath(FEATURE_LEFT_EYE),  edgePaint(0, 240, 255, 2.5f, 245))
         canvas.drawPath(landmarkPath(FEATURE_RIGHT_EYE), edgePaint(0, 240, 255, 2.5f, 245))
 
-        // Eye bags — light pink/magenta, low alpha so the skin tint underneath
-        // stays visible (drawn before the iris so the pupil sits on top).
-        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES),  fillPaint(255, 105, 180, 90))
-        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_INDICES), fillPaint(255, 105, 180, 90))
-        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES),  edgePaint(255, 20, 147, 1.5f, 190))
+        // Eye bags — light pink/magenta (Tiers 3, 2, and 1)
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_TIER3), fillPaint(255, 105, 180, 50))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_TIER3), fillPaint(255, 105, 180, 50))
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_TIER2), fillPaint(255, 105, 180, 80))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_TIER2), fillPaint(255, 105, 180, 80))
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES), fillPaint(255, 105, 180, 140))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_INDICES), fillPaint(255, 105, 180, 140))
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES), edgePaint(255, 20, 147, 1.5f, 190))
         canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_INDICES), edgePaint(255, 20, 147, 1.5f, 190))
 
         // Pupils / iris — cyan/white (needs the 478-point mesh with iris
