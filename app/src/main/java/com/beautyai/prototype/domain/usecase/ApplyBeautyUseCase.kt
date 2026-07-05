@@ -325,8 +325,10 @@ class ApplyBeautyUseCase {
                 // crescent. Allow any non-zero blurred edge through instead.
                 if (maskVal <= 0.01f) continue
 
-                // Re-boost the diluted mask value before using it downstream.
-                val boostedMask = (maskVal * 1.5f).coerceIn(0f, 1f)
+                // AGGRESSIVE MASK BOOST: the 30f blur dilutes opacity so
+                // heavily that a 1.5x boost still left the effect too sheer;
+                // 4.0x restores the core intensity of the crescent mask.
+                val boostedMask = (maskVal * 4.0f).coerceIn(0f, 1f)
 
                 val idx = y * w + x
                 val p = pixels[idx]
@@ -410,13 +412,15 @@ class ApplyBeautyUseCase {
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val pixels = IntArray(w * h)
         result.getPixels(pixels, 0, w, 0, 0, w, h)
-        val mouthRect = face.mouthRect(w, h)
 
-        // Increased the max lift slightly for a cleaner white
-        val liftAmount = (strength * 60f).toInt().coerceIn(0, 255)
+        // Stronger max lift so the effect reads clearly on all subjects
+        val liftAmount = (strength * 100f).toInt().coerceIn(0, 255)
 
-        for (y in mouthRect.top.toInt().coerceAtLeast(0) until mouthRect.bottom.toInt().coerceAtMost(h - 1)) {
-            for (x in mouthRect.left.toInt().coerceAtLeast(0) until mouthRect.right.toInt().coerceAtMost(w - 1)) {
+        // 1. BOUNDING BOX REMOVED: the mouthRect could clip real teeth near
+        // its edges. The feathered teethMask is now the sole gate, so it's
+        // safe (and correct) to scan the whole image.
+        for (y in 0 until h) {
+            for (x in 0 until w) {
                 val maskVal = teethMask[y][x]
                 if (maskVal <= 0f) continue
 
@@ -434,9 +438,9 @@ class ApplyBeautyUseCase {
                 // Lips and gums have high Red and low Green. Yellow teeth have high Red AND high Green.
                 val redness = (r - g).toFloat()
 
-                // If luminance is high enough AND redness is low, it is a tooth.
-                // This allows highly saturated yellow to pass, but strictly blocks pink/red lips.
-                val teethLikeness = smoothstep(90f, 160f, luminance) * (1f - smoothstep(20f, 50f, redness))
+                // RELAXED REDNESS GATE: widened to 50f-100f so severely
+                // yellow/stained teeth aren't misclassified as lips.
+                val teethLikeness = smoothstep(80f, 160f, luminance) * (1f - smoothstep(50f, 100f, redness))
 
                 if (teethLikeness <= 0f) continue
 
@@ -1014,7 +1018,7 @@ class ApplyBeautyUseCase {
         private const val IRIS_BLUR_RADIUS          = 4f
 
         // Under-eye / eye-bag reduction
-        private const val MAX_UNDER_EYE_LIFT        = 70f
+        private const val MAX_UNDER_EYE_LIFT        = 100f
         private const val EYE_BAG_BLUR_RADIUS       = 30f
         private const val EYES_BLUR_RADIUS          = 2f
 
