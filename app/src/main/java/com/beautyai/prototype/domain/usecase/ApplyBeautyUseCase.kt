@@ -321,10 +321,10 @@ class ApplyBeautyUseCase {
                 val p = pixels[idx]
                 val luminance = luma(p)
 
-                // LUMINANCE GATING shifted for bright studio lighting: targets
-                // moderate-to-bright shadow zones instead of only extreme dark
-                // shadows, which previously missed shadows lit by studio setups.
-                val shadowLikeness = 1f - smoothstep(110f, 190f, luminance)
+                // DYNAMIC LUMINANCE GATE: widened to 40f–160f so the effect
+                // catches both deep, dark shadows (large/low-hanging bags)
+                // and brighter studio-lit shadows in the same pass.
+                val shadowLikeness = 1f - smoothstep(40f, 160f, luminance)
 
                 // Skip pixels that are already bright to prevent the white "stroke" effect
                 if (shadowLikeness <= 0f) continue
@@ -996,7 +996,7 @@ class ApplyBeautyUseCase {
 
         // Under-eye / eye-bag reduction
         private const val MAX_UNDER_EYE_LIFT        = 45f
-        private const val EYE_BAG_BLUR_RADIUS       = 12f
+        private const val EYE_BAG_BLUR_RADIUS       = 30f
         private const val EYES_BLUR_RADIUS          = 2f
 
         // Blemish reduction
