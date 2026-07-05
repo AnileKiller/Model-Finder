@@ -25,24 +25,45 @@ class ApplyBeautyUseCase {
         //    segmentation mask so that structural facial features are never smoothed or corrected.
         val refinedMask = punchExclusionZones(faceData.segmentationMask, faceData, source.width, source.height)
 
-        // 2. Pre-blur the refined mask to feather the punched-out holes and eliminate hard edges.
-        val blurredMask = preBlurMask(refinedMask, source.width, source.height, 12)
+        // 2. Geometric face-oval mask (heavily feathered, blurRadius = 35f) —
+        // multiplying the segmentation mask by this kills any body-skin false
+        // positive that isn't near the face outline (e.g. a hand in frame),
+        // since the segmentation model has no notion of "this is a hand."
+        val faceOvalMask = createFeatureMask(
+            faceData, listOf(FEATURE_FACE_OVAL), source.width, source.height, 35f
+        )
+
+        // 3a. Smooth mask — segmentation-based (includes neck/body-skin at the
+        // reduced 0.4x strength baked into the detector) x the face-oval
+        // geometric mask, then feathered. Used for effects that should still
+        // reach past the jawline onto visible neck skin, just less strongly.
+        val smoothMask = preBlurMask(
+            multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 12
+        )
+
+        // 3b. Sharp mask — face oval only, with the same eye/brow/lip/nostril
+        // holes punched out. No segmentation/neck contribution at all, so
+        // detail-sensitive effects never touch body-skin or the hand.
+        val sharpMask = preBlurMask(
+            punchExclusionZones(faceOvalMask, faceData, source.width, source.height),
+            source.width, source.height, 12
+        )
 
         // Sharpening first — works on original, unmodified detail
         if (effective.faceSharpening > 0f)
-            result = applyFaceSharpening(result, faceData, blurredMask, effective.faceSharpening)
+            result = applyFaceSharpening(result, faceData, sharpMask, effective.faceSharpening)
 
         if (effective.skinSmoothing > 0f)
-            result = applySkinSmoothing(result, blurredMask, effective.skinSmoothing)
+            result = applySkinSmoothing(result, smoothMask, effective.skinSmoothing)
 
         if (effective.blemishReduction > 0f)
-            result = applyBlemishReduction(result, blurredMask, effective.blemishReduction)
+            result = applyBlemishReduction(result, sharpMask, effective.blemishReduction)
 
         if (effective.skinBrightness > 0f)
-            result = applySkinBrightness(result, blurredMask, effective.skinBrightness)
+            result = applySkinBrightness(result, smoothMask, effective.skinBrightness)
 
         if (effective.skinToneEnhancement > 0f)
-            result = applySkinTone(result, blurredMask, effective.skinToneEnhancement)
+            result = applySkinTone(result, smoothMask, effective.skinToneEnhancement)
 
         // 1. MASK FEED FIX: three distinct, non-overlapping-in-purpose masks so
         // each effect only ever samples the mask it geometrically needs —
@@ -583,6 +604,15 @@ class ApplyBeautyUseCase {
     // ── Low-level image math ─────────────────────────────────────────────────
 
     /**
+     * Per-pixel multiply of two same-sized masks (used to combine the
+     * segmentation-based mask with a purely geometric mask).
+     */
+    private fun multiplyMasks(a: Array<FloatArray>, b: Array<FloatArray>): Array<FloatArray> {
+        val h = a.size; val w = if (h > 0) a[0].size else 0
+        return Array(h) { y -> FloatArray(w) { x -> a[y][x] * b[y][x] } }
+    }
+
+    /**
      * 3. NEW: Fast separable box blur to feather the 2D FloatArray mask.
      */
     private fun preBlurMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
@@ -1033,7 +1063,7 @@ class ApplyBeautyUseCase {
         )
 
         // Skin smoothing
-        private const val MASK_THRESHOLD            = 0.3f
+        private const val MASK_THRESHOLD            = 0.2f
         private const val MAX_BILATERAL_RADIUS      = 6       
         private const val BILATERAL_SPATIAL_SIGMA   = 3f       
         private const val BILATERAL_COLOR_SIGMA     = 30f      
