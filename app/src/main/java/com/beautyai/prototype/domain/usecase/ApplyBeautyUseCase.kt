@@ -58,7 +58,8 @@ class ApplyBeautyUseCase {
                 faceData, listOf(LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES),
                 source.width, source.height, EYE_BAG_BLUR_RADIUS
             )
-            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, effective.underEyeReduction)
+            val avgSkinColor = calculateAverageSkinColor(source, refinedMask)
+            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, avgSkinColor, effective.underEyeReduction)
         }
 
         if (effective.eyeBrightness > 0f) {
@@ -329,60 +330,55 @@ class ApplyBeautyUseCase {
      * shifted up (110f–190f) so the effect responds correctly to bright
      * studio lighting instead of only the darkest shadow pixels.
      */
+    private fun calculateAverageSkinColor(src: Bitmap, skinMask: Array<FloatArray>): Int {
+        val w = src.width; val h = src.height
+        val pixels = IntArray(w * h)
+        src.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        var rSum = 0L; var gSum = 0L; var bSum = 0L; var count = 0
+
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                if (skinMask[y][x] > 0.5f) { // Only sample confident skin pixels
+                    val p = pixels[y * w + x]
+                    rSum += (p shr 16 and 0xFF)
+                    gSum += (p shr 8 and 0xFF)
+                    bSum += (p and 0xFF)
+                    count++
+                }
+            }
+        }
+        if (count == 0) return 0xFFFFFFFF.toInt() // Fallback
+        return (0xFF shl 24) or ((rSum / count).toInt() shl 16) or ((gSum / count).toInt() shl 8) or (bSum / count).toInt()
+    }
+
     private fun applyUnderEyeReduction(
         src: Bitmap,
         bagsMask: Array<FloatArray>,
         eyesMask: Array<FloatArray>,
+        avgSkinColor: Int,
         strength: Float
     ): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // Lowered the global max lift slightly so it doesn't wash out
-        val liftAmount = (strength * MAX_UNDER_EYE_LIFT).toInt().coerceIn(0, 255)
-
-        // COLOR CORRECTION: Eye bags are usually blue/purple. Pushing a pure
-        // screen blend makes them ashy/gray, so Red is lifted slightly more
-        // than Blue to warm the shadow up and match natural skin.
-        val rLift = (liftAmount * 1.15f).toInt().coerceIn(0, 255)
-        val bLift = (liftAmount * 0.85f).toInt().coerceIn(0, 255)
-
         for (y in 0 until h) {
             for (x in 0 until w) {
-                // MASK SUBTRACTION: remove the eye contour from the (heavily
-                // blurred) bag mask so the effect can't bleed onto the lash line.
-                val maskVal = (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f)
-                // 3. MASK DILUTION FIX: the 30f blur spreads the mask thin at
-                // the edges, so a strict MASK_THRESHOLD discarded most of the
-                // crescent. Allow any non-zero blurred edge through instead.
+                val rawBag = (bagsMask[y][x] * 2.0f).coerceIn(0f, 1f)
+                val maskVal = (rawBag - eyesMask[y][x]).coerceAtLeast(0f)
                 if (maskVal <= 0.01f) continue
-
-                // AGGRESSIVE MASK BOOST: the 30f blur dilutes opacity so
-                // heavily that a 1.5x boost still left the effect too sheer;
-                // 4.0x restores the core intensity of the crescent mask.
-                val boostedMask = (maskVal * 4.0f).coerceIn(0f, 1f)
 
                 val idx = y * w + x
                 val p = pixels[idx]
                 val luminance = luma(p)
 
-                // LUMINANCE GATE shifted higher (130f-210f) so the effect
-                // doesn't fade out on natural, richer-skin-tone shadows.
-                val shadowLikeness = 1f - smoothstep(130f, 210f, luminance)
+                // Target the shadows, avoiding highlights
+                val shadowLikeness = 1f - smoothstep(140f, 220f, luminance)
 
-                // Skip pixels that are already bright to prevent the white "stroke" effect
-                if (shadowLikeness <= 0f) continue
-
-                val a = p ushr 24
-                val r = screen(p shr 16 and 0xFF, rLift)
-                val g = screen(p shr 8  and 0xFF, liftAmount)
-                val b = screen(p        and 0xFF, bLift)
-
-                // Combine user strength, the boosted crescent mask, and shadow targeting
-                val finalAlpha = strength * boostedMask * shadowLikeness
-
-                pixels[idx] = blendPixel(p, (a shl 24) or (r shl 16) or (g shl 8) or b, finalAlpha)
+                // Blend the average skin color over the bag, keeping a tiny bit of transparency (0.85f) to preserve skin texture
+                val finalAlpha = strength * maskVal * shadowLikeness * 0.85f
+                pixels[idx] = blendPixel(p, avgSkinColor, finalAlpha)
             }
         }
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
