@@ -1106,10 +1106,25 @@ class ApplyBeautyUseCase {
             359, 446, 255, 339, 254, 253, 252, 256, 341
         )
 
-        private val LEFT_EYE_BAG_TIER2 = listOf(130, 226, 25, 110, 24, 23, 22, 26, 112, 244, 190, 56, 28, 27, 29, 30, 247)
-        private val RIGHT_EYE_BAG_TIER2 = listOf(359, 446, 255, 339, 254, 253, 252, 256, 341, 464, 414, 286, 258, 257, 259, 260, 467)
-        private val LEFT_EYE_BAG_TIER3 = listOf(247, 30, 29, 27, 28, 56, 190, 244, 233, 232, 231, 230, 229, 228, 31, 113)
-        private val RIGHT_EYE_BAG_TIER3 = listOf(467, 260, 259, 257, 258, 286, 414, 464, 453, 452, 451, 450, 449, 448, 261, 342)
+        // Tier 2: Connects the bottom of Tier 1 to the next row down on the cheek
+        private val LEFT_EYE_BAG_TIER2 = listOf(
+            112, 26, 22, 23, 24, 110, 25, 226, 130, // Inner to Outer (Top edge)
+            227, 31, 228, 229, 230, 231, 232, 233, 244  // Outer to Inner (Bottom edge)
+        )
+        private val RIGHT_EYE_BAG_TIER2 = listOf(
+            341, 256, 252, 253, 254, 339, 255, 446, 359, // Inner to Outer (Top edge)
+            447, 261, 448, 449, 450, 451, 452, 453, 464  // Outer to Inner (Bottom edge)
+        )
+
+        // Tier 3: Connects the bottom of Tier 2 to the next row down on the cheek
+        private val LEFT_EYE_BAG_TIER3 = listOf(
+            244, 233, 232, 231, 230, 229, 228, 31, 227, // Inner to Outer (Top edge)
+            143, 111, 117, 118, 119, 120, 121, 128, 245 // Outer to Inner (Bottom edge)
+        )
+        private val RIGHT_EYE_BAG_TIER3 = listOf(
+            464, 453, 452, 451, 450, 449, 448, 261, 447, // Inner to Outer (Top edge)
+            372, 340, 346, 347, 348, 349, 350, 357, 465  // Outer to Inner (Bottom edge)
+        )
 
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.2f
