@@ -76,7 +76,7 @@ class ApplyBeautyUseCase {
                 source.width, source.height, EYES_BLUR_RADIUS
             )
             val eyeBagsMask = createTieredEyeBagsMask(faceData, source.width, source.height, 6f)
-            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, refinedMask, effective.underEyeReduction)
+            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, effective.underEyeReduction)
         }
 
         if (effective.eyeBrightness > 0f) {
@@ -309,90 +309,53 @@ class ApplyBeautyUseCase {
     }
 
 
-    /**
-     * 2. STUDIO LIGHTING & BLEED FIX: [bagsMask] is fed with a heavy 12f blur
-     * so the crescent shape reads as a soft shadow rather than a hard cutout,
-     * but that same heavy blur bleeds the mask past the lash line and onto
-     * the eyeball itself. Subtracting the tightly-feathered [eyesMask] (2f
-     * blur) from [bagsMask] carves the eye contour back out, so the effect
-     * only ever touches actual under-eye skin. The luminance gate is also
-     * shifted up (110f–190f) so the effect responds correctly to bright
-     * studio lighting instead of only the darkest shadow pixels.
-     */
     private fun applyUnderEyeReduction(
-        src: Bitmap,
-        bagsMask: Array<FloatArray>,
-        eyesMask: Array<FloatArray>,
-        skinMask: Array<FloatArray>,
-        strength: Float
+        src: Bitmap, bagsMask: Array<FloatArray>, eyesMask: Array<FloatArray>, strength: Float
     ): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. Calculate the dynamic illumination cap
-        val histogram = IntArray(256)
-        var totalSkinPixels = 0
-        var totalLuma = 0L
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                if (skinMask[y][x] > 0.3f) {
-                    val l = luma(pixels[y * w + x]).toInt().coerceIn(0, 255)
-                    histogram[l]++
-                    totalSkinPixels++
-                    totalLuma += l
-                }
-            }
-        }
+        // 1. Create the Low-Frequency Illumination Map (approx 40px on a 1000px image)
+        val blurRadius = (w * 0.04f).toInt().coerceIn(15, 60)
+        val blurPixels = gaussianBlur(pixels, w, h, blurRadius)
 
-        val lumaCap: Float
-        if (totalSkinPixels > 0) {
-            val avgLuma = totalLuma.toFloat() / totalSkinPixels
-            val top10Count = (totalSkinPixels / 10).coerceAtLeast(1)
-            var top10Sum = 0L
-            var count = 0
-            for (i in 255 downTo 0) {
-                val take = minOf(histogram[i], top10Count - count)
-                top10Sum += take * i
-                count += take
-                if (count >= top10Count) break
-            }
-            val avgBrightest = top10Sum.toFloat() / top10Count
-            // The max allowed luma is the average of the overall face and the brightest highlights
-            lumaCap = (avgLuma + avgBrightest) / 2f
-        } else {
-            lumaCap = 255f
-        }
-
-        // Max raw brightness to add (0 to 100 scale)
-        val maxLift = strength * 100f
+        val maxLift = strength * 255f 
 
         for (y in 0 until h) {
             for (x in 0 until w) {
-                // 2. Subtract the eye mask to protect the lash line
                 val rawMask = (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f)
                 if (rawMask <= 0.01f) continue
 
                 val idx = y * w + x
                 val p = pixels[idx]
-                val currentLuma = luma(p)
+                val blurP = blurPixels[idx]
 
-                val availableLift = maxOf(0f, lumaCap - currentLuma)
-                val actualLift = minOf(maxLift * rawMask, availableLift)
+                val pLuma = luma(p)
+                val blurLuma = luma(blurP)
 
-                if (actualLift <= 0f) continue
+                // 2. Isolate Negative Shadows (Pixel is darker than local illumination)
+                val shadowDepth = maxOf(0f, blurLuma - pLuma)
+                
+                // If it's not a shadow (e.g., a bright pore or highlight), leave it completely untouched
+                if (shadowDepth <= 2f) continue
 
-                val lift = actualLift.toInt().coerceIn(0, 255)
+                // 3. Modulate lift: Deeper shadows get more lift, shallow shadows get less
+                val shadowFactor = smoothstep(5f, 40f, shadowDepth) 
+                val actualLift = (maxLift * rawMask * shadowFactor).toInt().coerceIn(0, 255)
+                
+                if (actualLift == 0) continue
+
                 val a = p ushr 24
                 val r = p shr 16 and 0xFF
                 val g = p shr 8 and 0xFF
                 val b = p and 0xFF
 
-                // Pure Screen Blend (Optical Brightening)
-                val nr = r + lift - (r * lift) / 255
-                val ng = g + lift - (g * lift) / 255
-                val nb = b + lift - (b * lift) / 255
-
+                // 4. Pure Screen Blend (Optical brightening, preserves underlying hue)
+                val nr = r + actualLift - (r * actualLift) / 255
+                val ng = g + actualLift - (g * actualLift) / 255
+                val nb = b + actualLift - (b * actualLift) / 255
+                
                 pixels[idx] = (a shl 24) or (nr shl 16) or (ng shl 8) or nb
             }
         }
@@ -1136,24 +1099,24 @@ class ApplyBeautyUseCase {
             359, 446, 255, 339, 254, 253, 252, 256, 341
         )
 
-        // Tier 2: Full wrap-around cheek loop
+        // Tier 2: Connects the bottom of Tier 1 down to the middle cheek row
         private val LEFT_EYE_BAG_TIER2 = listOf(
-            112, 26, 22, 23, 24, 110, 25, 226, 130, // Inner to Outer (Top edge)
-            227, 31, 228, 229, 230, 231, 232, 233, 244  // Outer to Inner (Bottom edge)
+            112, 26, 22, 23, 24, 110, 25, // Inner to Outer (Top edge)
+            31, 228, 229, 230, 231, 232, 233  // Outer to Inner (Bottom edge)
         )
         private val RIGHT_EYE_BAG_TIER2 = listOf(
-            341, 256, 252, 253, 254, 339, 255, 446, 359,
-            447, 261, 448, 449, 450, 451, 452, 453, 464
+            341, 256, 252, 253, 254, 339, 255, // Inner to Outer (Top edge)
+            261, 448, 449, 450, 451, 452, 453  // Outer to Inner (Bottom edge)
         )
 
-        // Tier 3: Full wrap-around cheek loop
+        // Tier 3: Connects the bottom of Tier 2 down to the lowest cheek shadow boundary
         private val LEFT_EYE_BAG_TIER3 = listOf(
-            244, 233, 232, 231, 230, 229, 228, 31, 227,
-            143, 111, 117, 118, 119, 120, 121, 128, 245
+            233, 232, 231, 230, 229, 228, 31, // Inner to Outer (Top edge)
+            111, 117, 118, 119, 120, 121, 128 // Outer to Inner (Bottom edge)
         )
         private val RIGHT_EYE_BAG_TIER3 = listOf(
-            464, 453, 452, 451, 450, 449, 448, 261, 447,
-            372, 340, 346, 347, 348, 349, 350, 357, 465
+            453, 452, 451, 450, 449, 448, 261, // Inner to Outer (Top edge)
+            340, 346, 347, 348, 349, 350, 357  // Outer to Inner (Bottom edge)
         )
 
         // Skin smoothing
