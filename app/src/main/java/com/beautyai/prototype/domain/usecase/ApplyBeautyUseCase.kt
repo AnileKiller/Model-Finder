@@ -901,26 +901,42 @@ class ApplyBeautyUseCase {
             canvas.drawPath(landmarkPath(RIGHT_IRIS_INDICES), edgePaint(0, 240, 255, 1.5f, 245))
         }
 
-        // ── 3. All 468 landmark dots and indices ─────────────────────────────
+        // ── 3. All 478 landmark dots and readable cheek indices ───────────────
         val dotPaint  = Paint().apply {
             color = Color.argb(255, 255, 255, 255)
             style = Paint.Style.FILL
             isAntiAlias = true
         }
         val textPaint = Paint().apply {
-            color = Color.YELLOW // Yellow stands out against the green skin mask
-            textSize = (w * 0.012f).coerceIn(10f, 30f) // Scales with image resolution
+            color = Color.YELLOW
+            textSize = (w * 0.01f).coerceIn(12f, 26f) // Shrunk text size
             isAntiAlias = true
-            setShadowLayer(2f, 1f, 1f, Color.BLACK) // Adds a drop shadow for readability
+            // Drop shadow removed to prevent smearing
         }
         val dotR = (w * 0.0025f).coerceIn(1.5f, 4f)
+        
+        // Reference points for our bounding box
+        val noseTip = lm[4]
+        val leftEye = lm[159]
+        val rightEye = lm[386]
+        val upperLip = lm[0]
+        val eyeBaseline = minOf(leftEye.y, rightEye.y) + 0.03f
         
         for ((index, l) in lm.withIndex()) {
             val px = l.x * w
             val py = l.y * h
             canvas.drawCircle(px, py, dotR, dotPaint)
-            // Draw the index number slightly offset to the top-right of the dot
-            canvas.drawText(index.toString(), px + 4f, py - 4f, textPaint)
+            
+            // FILTER: Only draw text in the cheek areas to prevent a massive blob of text
+            val isBelowEyes = l.y > eyeBaseline
+            val isAboveLip = l.y < upperLip.y
+            // Exclude the highly dense nose bridge/tip area
+            val distToNoseX = kotlin.math.abs(l.x - noseTip.x)
+            val isNotNose = distToNoseX > 0.06f 
+            
+            if (isBelowEyes && isAboveLip && isNotNose) {
+                canvas.drawText(index.toString(), px + 3f, py - 3f, textPaint)
+            }
         }
 
         // ── 4. Legend ────────────────────────────────────────────────────────
