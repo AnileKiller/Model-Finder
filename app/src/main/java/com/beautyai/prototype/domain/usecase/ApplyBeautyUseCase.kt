@@ -901,14 +901,27 @@ class ApplyBeautyUseCase {
             canvas.drawPath(landmarkPath(RIGHT_IRIS_INDICES), edgePaint(0, 240, 255, 1.5f, 245))
         }
 
-        // ── 3. All 468 landmark dots ─────────────────────────────────────────
+        // ── 3. All 468 landmark dots and indices ─────────────────────────────
         val dotPaint  = Paint().apply {
-            color = Color.argb(210, 255, 255, 255)
+            color = Color.argb(255, 255, 255, 255)
             style = Paint.Style.FILL
             isAntiAlias = true
         }
+        val textPaint = Paint().apply {
+            color = Color.YELLOW // Yellow stands out against the green skin mask
+            textSize = (w * 0.012f).coerceIn(10f, 30f) // Scales with image resolution
+            isAntiAlias = true
+            setShadowLayer(2f, 1f, 1f, Color.BLACK) // Adds a drop shadow for readability
+        }
         val dotR = (w * 0.0025f).coerceIn(1.5f, 4f)
-        for (l in lm) canvas.drawCircle(l.x * w, l.y * h, dotR, dotPaint)
+        
+        for ((index, l) in lm.withIndex()) {
+            val px = l.x * w
+            val py = l.y * h
+            canvas.drawCircle(px, py, dotR, dotPaint)
+            // Draw the index number slightly offset to the top-right of the dot
+            canvas.drawText(index.toString(), px + 4f, py - 4f, textPaint)
+        }
 
         // ── 4. Legend ────────────────────────────────────────────────────────
         drawDebugLegend(canvas, w, h)
