@@ -1,6 +1,7 @@
 package com.beautyai.prototype.domain.usecase
 
 import android.graphics.Bitmap
+import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -24,36 +25,75 @@ class ApplyBeautyUseCase {
         //    segmentation mask so that structural facial features are never smoothed or corrected.
         val refinedMask = punchExclusionZones(faceData.segmentationMask, faceData, source.width, source.height)
 
-        // 2. Pre-blur the refined mask to feather the punched-out holes and eliminate hard edges.
-        val blurredMask = preBlurMask(refinedMask, source.width, source.height, 12)
+        // 2. Geometric face-oval mask (heavily feathered, blurRadius = 35f) —
+        // multiplying the segmentation mask by this kills any body-skin false
+        // positive that isn't near the face outline (e.g. a hand in frame),
+        // since the segmentation model has no notion of "this is a hand."
+        val faceOvalMask = createFeatureMask(
+            faceData, listOf(FEATURE_FACE_OVAL), source.width, source.height, 35f
+        )
+
+        // 3a. Smooth mask — segmentation-based (includes neck/body-skin at the
+        // reduced 0.4x strength baked into the detector) x the face-oval
+        // geometric mask, then feathered. Used for effects that should still
+        // reach past the jawline onto visible neck skin, just less strongly.
+        val smoothMask = preBlurMask(
+            multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 12
+        )
+
+        // 3b. Sharp mask — face oval only, with the same eye/brow/lip/nostril
+        // holes punched out. No segmentation/neck contribution at all, so
+        // detail-sensitive effects never touch body-skin or the hand.
+        val sharpMask = preBlurMask(
+            punchExclusionZones(faceOvalMask, faceData, source.width, source.height),
+            source.width, source.height, 12
+        )
 
         // Sharpening first — works on original, unmodified detail
         if (effective.faceSharpening > 0f)
-            result = applyFaceSharpening(result, faceData, blurredMask, effective.faceSharpening)
+            result = applyFaceSharpening(result, faceData, sharpMask, effective.faceSharpening)
 
         if (effective.skinSmoothing > 0f)
-            result = applySkinSmoothing(result, blurredMask, effective.skinSmoothing)
+            result = applySkinSmoothing(result, smoothMask, effective.skinSmoothing)
 
         if (effective.blemishReduction > 0f)
-            result = applyBlemishReduction(result, blurredMask, effective.blemishReduction)
+            result = applyBlemishReduction(result, sharpMask, effective.blemishReduction)
 
         if (effective.skinBrightness > 0f)
-            result = applySkinBrightness(result, blurredMask, effective.skinBrightness)
+            result = applySkinBrightness(result, smoothMask, effective.skinBrightness)
 
         if (effective.skinToneEnhancement > 0f)
-            result = applySkinTone(result, blurredMask, effective.skinToneEnhancement)
+            result = applySkinTone(result, smoothMask, effective.skinToneEnhancement)
 
+        // 1. MASK FEED FIX: three distinct, non-overlapping-in-purpose masks so
+        // each effect only ever samples the mask it geometrically needs —
+        // eliminates the mathematical collision where the eye-bag blur bled
+        // into the eyeball/lash line and the eye-brightness glow leaked onto
+        // the whole eye socket instead of just the iris.
         if (effective.underEyeReduction > 0f) {
-            val bagsMask = buildEyeBagMask(faceData, source.width, source.height)
-            val eyesMask = buildEyeMask(faceData, source.width, source.height)
-            result = applyUnderEyeReduction(result, bagsMask, eyesMask, faceData.segmentationMask, effective.underEyeReduction)
+            val eyesMask = createFeatureMask(
+                faceData, listOf(LEFT_EYE_INDICES, RIGHT_EYE_INDICES),
+                source.width, source.height, EYES_BLUR_RADIUS
+            )
+            val eyeBagsMask = createTieredEyeBagsMask(faceData, source.width, source.height, 6f)
+            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, refinedMask, effective.underEyeReduction)
         }
 
-        if (effective.eyeBrightness > 0f)
-            result = applyEyeBrightness(result, faceData, effective.eyeBrightness)
+        if (effective.eyeBrightness > 0f) {
+            val irisMask = createFeatureMask(
+                faceData, listOf(LEFT_IRIS_INDICES, RIGHT_IRIS_INDICES),
+                source.width, source.height, IRIS_BLUR_RADIUS
+            )
+            result = applyEyeBrightness(result, faceData, irisMask, effective.eyeBrightness)
+        }
 
-        if (effective.teethWhitening > 0f)
-            result = applyTeethWhitening(result, faceData, effective.teethWhitening)
+        if (effective.teethWhitening > 0f) {
+            val teethMask = createFeatureMask(
+                faceData, listOf(FEATURE_LIPS_INNER),
+                source.width, source.height, 4f
+            )
+            result = applyTeethWhitening(result, faceData, teethMask, effective.teethWhitening)
+        }
 
         return result
     }
@@ -153,8 +193,16 @@ class ApplyBeautyUseCase {
         return result
     }
 
+    /**
+     * 3. FIX: The old implementation round-tripped every pixel through
+     * rgbToHsl()/hslToRgb() (multiple divisions + branches per pixel), which
+     * was the single biggest contributor to multi-second stalls on full-res
+     * photos. Brightness lift needs no colour-space conversion at all — a
+     * per-channel integer Screen blend produces the same "lift shadows,
+     * preserve highlights" look and runs entirely in cheap integer ops.
+     */
     private fun applySkinBrightness(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
-        val liftFraction = strength * MAX_LIGHTNESS_LIFT 
+        val liftAmount = (strength * MAX_BRIGHTNESS_LIFT).toInt().coerceIn(0, 255)
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
@@ -170,11 +218,12 @@ class ApplyBeautyUseCase {
                 val g = p shr 8  and 0xFF
                 val b = p        and 0xFF
 
-                val hsl = rgbToHsl(r, g, b)
-                hsl[2] = (hsl[2] + liftFraction).coerceIn(0f, 1f)
-                val rgb = hslToRgb(hsl[0], hsl[1], hsl[2])
+                // Fast Integer Screen Blending — no float math, no HSL conversion.
+                val br = 255 - ((255 - r) * (255 - liftAmount)) / 255
+                val bg = 255 - ((255 - g) * (255 - liftAmount)) / 255
+                val bb = 255 - ((255 - b) * (255 - liftAmount)) / 255
 
-                val enhanced = (a shl 24) or (rgb[0] shl 16) or (rgb[1] shl 8) or rgb[2]
+                val enhanced = (a shl 24) or (br shl 16) or (bg shl 8) or bb
                 pixels[idx] = blendPixel(p, enhanced, maskVal * strength)
             }
         }
@@ -215,12 +264,10 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // I recommend lowering this radius in your companion object from 8 to 5. 
-        // A radius of 8 pulls colors from too far away, which causes color bleeding near edges.
-        val blurred = gaussianBlur(pixels, w, h, 5) 
-
-        // The maximum luma difference. If a pixel is darker than this, it's an eye/lip edge, not a blemish.
-        val MAX_BLEMISH_DIFFERENCE = 55f 
+        val narrowRadius = (w * 0.008f).toInt().coerceIn(2, 10)
+        val wideRadius   = (w * 0.05f).toInt().coerceIn(15, 45)
+        val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
+        val blurWide   = gaussianBlur(pixels, w, h, wideRadius)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -229,40 +276,61 @@ class ApplyBeautyUseCase {
 
                 val idx = y * w + x
                 val p = pixels[idx]
-                val bp = blurred[idx]
+                val target = blurWide[idx]
+                val narrow = blurNarrow[idx]
 
-                val pLuma = luma(p)
-                val bLuma = luma(bp)
-                val diff = bLuma - pLuma
+                val targetLuma = maxOf(luma(target), 5f)
+                val narrowLuma = luma(narrow)
 
-                // 1. Check if it falls inside the "Blemish Zone" (Darker than skin, but not as dark as an eye)
-                if (diff > BLEMISH_DARK_THRESHOLD && diff < MAX_BLEMISH_DIFFERENCE) {
+                // 1. Relative Contrast Ratio (Crucial for dark skin tones)
+                val contrastRatio = kotlin.math.abs(narrowLuma - targetLuma) / targetLuma
+                // Triggers if contrast deviates by 4% to 15% from local skin
+                val contrastLikeness = smoothstep(0.04f, 0.15f, contrastRatio)
 
-                    // 2. Taper the effect near the limits to prevent harsh pixelated cutoffs
-                    val edgeProtection = 1f - smoothstep(MAX_BLEMISH_DIFFERENCE - 15f, MAX_BLEMISH_DIFFERENCE, diff)
+                // 2. Relative Redness (Active acne)
+                val nR = narrow shr 16 and 0xFF; val nG = narrow shr 8 and 0xFF
+                val tR = target shr 16 and 0xFF; val tG = target shr 8 and 0xFF
+                val redLikeness = smoothstep(4f, 15f, (nR - nG.toFloat()) - (tR - tG.toFloat()))
 
-                    // Apply the fix, respecting the mask, user strength, and edge protection
-                    val finalAlpha = maskVal * strength * 0.8f * edgeProtection
+                val blemishLikeness = maxOf(contrastLikeness, redLikeness)
 
-                    pixels[idx] = blendPixel(p, bp, finalAlpha)
-                }
+                // Protect massive shadows/edges (nostrils, jawline gaps)
+                val edgeProtection = 1f - smoothstep(0.25f, 0.45f, contrastRatio)
+
+                val finalAlpha = blemishLikeness * edgeProtection * maskVal * strength
+                if (finalAlpha <= 0.01f) continue
+
+                pixels[idx] = blendPixel(p, target, finalAlpha)
             }
         }
-
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         result.setPixels(pixels, 0, w, 0, 0, w, h)
         return result
     }
 
 
+    /**
+     * 2. STUDIO LIGHTING & BLEED FIX: [bagsMask] is fed with a heavy 12f blur
+     * so the crescent shape reads as a soft shadow rather than a hard cutout,
+     * but that same heavy blur bleeds the mask past the lash line and onto
+     * the eyeball itself. Subtracting the tightly-feathered [eyesMask] (2f
+     * blur) from [bagsMask] carves the eye contour back out, so the effect
+     * only ever touches actual under-eye skin. The luminance gate is also
+     * shifted up (110f–190f) so the effect responds correctly to bright
+     * studio lighting instead of only the darkest shadow pixels.
+     */
     private fun applyUnderEyeReduction(
-        src: Bitmap, bagsMask: Array<FloatArray>, eyesMask: Array<FloatArray>,
-        skinMask: Array<FloatArray>, strength: Float
+        src: Bitmap,
+        bagsMask: Array<FloatArray>,
+        eyesMask: Array<FloatArray>,
+        skinMask: Array<FloatArray>,
+        strength: Float
     ): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
+        // 1. Calculate the dynamic illumination cap
         val histogram = IntArray(256)
         var totalSkinPixels = 0
         var totalLuma = 0L
@@ -277,24 +345,31 @@ class ApplyBeautyUseCase {
             }
         }
 
-        val lumaCap = if (totalSkinPixels > 0) {
+        val lumaCap: Float
+        if (totalSkinPixels > 0) {
             val avgLuma = totalLuma.toFloat() / totalSkinPixels
             val top10Count = (totalSkinPixels / 10).coerceAtLeast(1)
-            var top10Sum = 0L; var count = 0
+            var top10Sum = 0L
+            var count = 0
             for (i in 255 downTo 0) {
                 val take = minOf(histogram[i], top10Count - count)
                 top10Sum += take * i
                 count += take
                 if (count >= top10Count) break
             }
-            (avgLuma + (top10Sum.toFloat() / top10Count)) / 2f
-        } else 255f
+            val avgBrightest = top10Sum.toFloat() / top10Count
+            // The max allowed luma is the average of the overall face and the brightest highlights
+            lumaCap = (avgLuma + avgBrightest) / 2f
+        } else {
+            lumaCap = 255f
+        }
 
-        // HSL Lightness works on a 0.0 to 1.0 scale. 0.45f represents a very strong lift.
-        val maxLift = strength * 0.45f
+        // Max raw brightness to add (0 to 100 scale)
+        val maxLift = strength * 100f
 
         for (y in 0 until h) {
             for (x in 0 until w) {
+                // 2. Subtract the eye mask to protect the lash line
                 val rawMask = (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f)
                 if (rawMask <= 0.01f) continue
 
@@ -302,57 +377,21 @@ class ApplyBeautyUseCase {
                 val p = pixels[idx]
                 val currentLuma = luma(p)
 
-                val availableLift = maxOf(0f, lumaCap - currentLuma) / 255f
+                val availableLift = maxOf(0f, lumaCap - currentLuma)
                 val actualLift = minOf(maxLift * rawMask, availableLift)
 
-                if (actualLift <= 0.005f) continue
+                if (actualLift <= 0f) continue
 
+                val lift = actualLift.toInt().coerceIn(0, 255)
                 val a = p ushr 24
                 val r = p shr 16 and 0xFF
                 val g = p shr 8 and 0xFF
                 val b = p and 0xFF
 
-                // Fast Localized HSL Conversion
-                val rf = r / 255f; val gf = g / 255f; val bf = b / 255f
-                val max = maxOf(rf, gf, bf); val min = minOf(rf, gf, bf)
-                var l = (max + min) / 2f
-                var hVal = 0f; var s = 0f
-
-                if (max != min) {
-                    val d = max - min
-                    s = if (l > 0.5f) d / (2f - max - min) else d / (max + min)
-                    hVal = when (max) {
-                        rf -> (gf - bf) / d + (if (gf < bf) 6f else 0f)
-                        gf -> (bf - rf) / d + 2f
-                        else -> (rf - gf) / d + 4f
-                    }
-                    hVal /= 6f
-                }
-
-                // Lift Lightness, completely locking Hue and Saturation
-                l = (l + actualLift).coerceIn(0f, 1f)
-
-                var nr = 0; var ng = 0; var nb = 0
-                if (s == 0f) {
-                    val v = (l * 255).toInt().coerceIn(0, 255)
-                    nr = v; ng = v; nb = v
-                } else {
-                    val q = if (l < 0.5f) l * (1f + s) else l + s - l * s
-                    val pVal = 2f * l - q
-
-                    fun hue2rgb(p: Float, q: Float, t: Float): Float {
-                        var tc = t
-                        if (tc < 0f) tc += 1f
-                        if (tc > 1f) tc -= 1f
-                        if (tc < 1f/6f) return p + (q - p) * 6f * tc
-                        if (tc < 1f/2f) return q
-                        if (tc < 2f/3f) return p + (q - p) * (2f/3f - tc) * 6f
-                        return p
-                    }
-                    nr = (hue2rgb(pVal, q, hVal + 1f/3f) * 255).toInt().coerceIn(0, 255)
-                    ng = (hue2rgb(pVal, q, hVal) * 255).toInt().coerceIn(0, 255)
-                    nb = (hue2rgb(pVal, q, hVal - 1f/3f) * 255).toInt().coerceIn(0, 255)
-                }
+                // Pure Screen Blend (Optical Brightening)
+                val nr = r + lift - (r * lift) / 255
+                val ng = g + lift - (g * lift) / 255
+                val nb = b + lift - (b * lift) / 255
 
                 pixels[idx] = (a shl 24) or (nr shl 16) or (ng shl 8) or nb
             }
@@ -363,56 +402,13 @@ class ApplyBeautyUseCase {
     }
 
     /**
-     * Rasterises the Tier 2 and Tier 3 under-eye bag polygons into a float mask.
-     * The tier arrays cover the orbital region below the lash line; combining both
-     * gives a smooth, tapering coverage without the spike artefact caused by the
-     * lowest temple points.
+     * 1. IRIS & PUPIL DISTINGUISHING: [irisMask] is a feathered alpha mask
+     * built from the canonical MediaPipe iris landmarks (passed in from
+     * [invoke]) so the "sparkle" brightening is concentrated on the
+     * iris/pupil itself rather than the whole eye socket — otherwise the
+     * whole eyeball glows instead of just the pupil.
      */
-    private fun buildEyeBagMask(face: FaceData, w: Int, h: Int): Array<FloatArray> {
-        if (face.landmarks.size < 468) return Array(h) { FloatArray(w) }
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val paint = Paint().apply {
-            color = Color.WHITE
-            style = Paint.Style.FILL
-            isAntiAlias = true
-        }
-        for (indices in listOf(LEFT_EYE_BAG_TIER2, RIGHT_EYE_BAG_TIER2,
-                               LEFT_EYE_BAG_TIER3, RIGHT_EYE_BAG_TIER3)) {
-            val path = Path()
-            path.moveTo(face.landmarks[indices[0]].x * w, face.landmarks[indices[0]].y * h)
-            for (i in 1 until indices.size) path.lineTo(face.landmarks[indices[i]].x * w, face.landmarks[indices[i]].y * h)
-            path.close()
-            canvas.drawPath(path, paint)
-        }
-        return bitmapToFloatArray(bmp, w, h)
-    }
-
-    /**
-     * Rasterises the eye contour polygons into a float mask so the caller can
-     * subtract them from the bag mask, preventing any processing on the eyeball
-     * itself or the lower lash line.
-     */
-    private fun buildEyeMask(face: FaceData, w: Int, h: Int): Array<FloatArray> {
-        if (face.landmarks.size < 468) return Array(h) { FloatArray(w) }
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val paint = Paint().apply {
-            color = Color.WHITE
-            style = Paint.Style.FILL
-            isAntiAlias = true
-        }
-        for (indices in listOf(FEATURE_LEFT_EYE, FEATURE_RIGHT_EYE)) {
-            val path = Path()
-            path.moveTo(face.landmarks[indices[0]].x * w, face.landmarks[indices[0]].y * h)
-            for (i in 1 until indices.size) path.lineTo(face.landmarks[indices[i]].x * w, face.landmarks[indices[i]].y * h)
-            path.close()
-            canvas.drawPath(path, paint)
-        }
-        return bitmapToFloatArray(bmp, w, h)
-    }
-
-    private fun applyEyeBrightness(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    private fun applyEyeBrightness(src: Bitmap, face: FaceData, irisMask: Array<FloatArray>, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val pixels = IntArray(w * h)
@@ -420,8 +416,11 @@ class ApplyBeautyUseCase {
         val liftAmount = (strength * MAX_EYE_LIFT).toInt().coerceIn(0, 255)
 
         listOf(face.leftEyeRect(w, h), face.rightEyeRect(w, h)).forEach { rect ->
-            for (y in rect.top.toInt() until rect.bottom.toInt().coerceAtMost(h)) {
-                for (x in rect.left.toInt() until rect.right.toInt().coerceAtMost(w)) {
+            for (y in rect.top.toInt().coerceAtLeast(0) until rect.bottom.toInt().coerceAtMost(h)) {
+                for (x in rect.left.toInt().coerceAtLeast(0) until rect.right.toInt().coerceAtMost(w)) {
+                    val irisVal = irisMask[y][x]
+                    if (irisVal < MASK_THRESHOLD) continue
+
                     val idx = y * w + x
                     val p = pixels[idx]
                     val luminance = luma(p)
@@ -432,11 +431,10 @@ class ApplyBeautyUseCase {
                     val r = screen(p shr 16 and 0xFF, liftAmount)
                     val g = screen(p shr 8  and 0xFF, liftAmount)
                     val b = screen(p        and 0xFF, liftAmount)
-                    val feather = ellipseFeather(rect, x, y)
                     pixels[idx] = blendPixel(
                         p,
                         (a shl 24) or (r shl 16) or (g shl 8) or b,
-                        strength * feather * eyeLikeness
+                        strength * irisVal * eyeLikeness
                     )
                 }
             }
@@ -445,18 +443,31 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    private fun applyTeethWhitening(src: Bitmap, face: FaceData, strength: Float): Bitmap {
+    /**
+     * 1. MIGRATED TO GEOMETRIC MASK: previously relied on [ellipseFeather]
+     * over the whole mouth bounding box, which faded out real teeth near the
+     * rect edges and let the effect leak onto lips/gums whenever the mouth
+     * wasn't perfectly centered in its rect. Now gated by [teethMask] — a
+     * feathered mask built directly from the inner-lip contour — so the
+     * effect only ever touches the actual mouth opening.
+     */
+    private fun applyTeethWhitening(src: Bitmap, face: FaceData, teethMask: Array<FloatArray>, strength: Float): Bitmap {
         val w = src.width; val h = src.height
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val pixels = IntArray(w * h)
         result.getPixels(pixels, 0, w, 0, 0, w, h)
-        val mouthRect = face.mouthRect(w, h)
 
-        // Increased the max lift slightly for a cleaner white
-        val liftAmount = (strength * 60f).toInt().coerceIn(0, 255)
+        // Stronger max lift so the effect reads clearly on all subjects
+        val liftAmount = (strength * 100f).toInt().coerceIn(0, 255)
 
-        for (y in mouthRect.top.toInt().coerceAtLeast(0) until mouthRect.bottom.toInt().coerceAtMost(h - 1)) {
-            for (x in mouthRect.left.toInt().coerceAtLeast(0) until mouthRect.right.toInt().coerceAtMost(w - 1)) {
+        // 1. BOUNDING BOX REMOVED: the mouthRect could clip real teeth near
+        // its edges. The feathered teethMask is now the sole gate, so it's
+        // safe (and correct) to scan the whole image.
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val maskVal = teethMask[y][x]
+                if (maskVal <= 0f) continue
+
                 val idx = y * w + x
                 val p = pixels[idx]
                 val a = p ushr 24
@@ -471,9 +482,9 @@ class ApplyBeautyUseCase {
                 // Lips and gums have high Red and low Green. Yellow teeth have high Red AND high Green.
                 val redness = (r - g).toFloat()
 
-                // If luminance is high enough AND redness is low, it is a tooth.
-                // This allows highly saturated yellow to pass, but strictly blocks pink/red lips.
-                val teethLikeness = smoothstep(90f, 160f, luminance) * (1f - smoothstep(20f, 50f, redness))
+                // RELAXED REDNESS GATE: widened to 50f-100f so severely
+                // yellow/stained teeth aren't misclassified as lips.
+                val teethLikeness = smoothstep(80f, 160f, luminance) * (1f - smoothstep(50f, 100f, redness))
 
                 if (teethLikeness <= 0f) continue
 
@@ -493,9 +504,7 @@ class ApplyBeautyUseCase {
                         (screen(ng, liftAmount) shl 8) or
                         screen(nb, liftAmount)
 
-                val feather = ellipseFeather(mouthRect, x, y)
-
-                pixels[idx] = blendPixel(p, lifted, strength * feather * teethLikeness)
+                pixels[idx] = blendPixel(p, lifted, strength * maskVal * teethLikeness)
             }
         }
         result.setPixels(pixels, 0, w, 0, 0, w, h)
@@ -533,50 +542,117 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    // ── HSL colour space helpers ─────────────────────────────────────────────
+    // ── Feature mask generation ──────────────────────────────────────────────
 
-    private fun rgbToHsl(r: Int, g: Int, b: Int): FloatArray {
-        val rf = r / 255f; val gf = g / 255f; val bf = b / 255f
-        val max = maxOf(rf, gf, bf); val min = minOf(rf, gf, bf)
-        val l = (max + min) / 2f
-        if (max == min) return floatArrayOf(0f, 0f, l) 
-        val d = max - min
-        val s = if (l > 0.5f) d / (2f - max - min) else d / (max + min)
-        val h = when (max) {
-            rf   -> ((gf - bf) / d + (if (gf < bf) 6f else 0f)) / 6f
-            gf   -> ((bf - rf) / d + 2f) / 6f
-            else -> ((rf - gf) / d + 4f) / 6f
+    /**
+     * 1. NEW: Builds a feathered per-pixel alpha mask (values in [0,1], sized
+     * [h][w]) for one or more geometric landmark regions — e.g. the iris/pupil
+     * rings or the crescent-shaped eye-bag contours.
+     *
+     * Each entry in [polygons] is a list of FaceMesh landmark indices; every
+     * list is mapped from normalised [0,1] landmark space to absolute Bitmap
+     * coordinates and drawn as a filled white polygon on a black Canvas. A
+     * native [BlurMaskFilter] on the fill Paint feathers the polygon edges so
+     * downstream effects blend smoothly instead of showing a hard cutout.
+     *
+     * The resulting Bitmap is opaque black outside the polygons and white
+     * (blurred to grey at the edges) inside them, so the red channel alone
+     * (equal to green/blue everywhere, and — since the fill colour is pure
+     * white — numerically equal to the blurred alpha coverage at the edges)
+     * can be read back directly as the isolated [0,1] mask value.
+     */
+    private fun createFeatureMask(
+        faceData: FaceData,
+        polygons: List<List<Int>>,
+        w: Int,
+        h: Int,
+        blurRadius: Float,
+        expansion: Float = 0f
+    ): Array<FloatArray> {
+        val maskBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(maskBitmap)
+        canvas.drawColor(Color.BLACK)
+
+        val fillPaint = Paint().apply {
+            color = Color.WHITE
+            isAntiAlias = true
+            if (expansion > 0f) {
+                style = Paint.Style.FILL_AND_STROKE
+                strokeWidth = expansion
+                strokeJoin = Paint.Join.ROUND
+            } else {
+                style = Paint.Style.FILL
+            }
+            if (blurRadius > 0f) {
+                maskFilter = BlurMaskFilter(blurRadius, BlurMaskFilter.Blur.NORMAL)
+            }
         }
-        return floatArrayOf(h * 360f, s, l)
+
+        polygons.forEach { indices ->
+            if (indices.isEmpty()) return@forEach
+            val path = Path()
+            val first = faceData.landmarks[indices[0]]
+            path.moveTo(first.x * w, first.y * h)
+            for (i in 1 until indices.size) {
+                val lm = faceData.landmarks[indices[i]]
+                path.lineTo(lm.x * w, lm.y * h)
+            }
+            path.close()
+            canvas.drawPath(path, fillPaint)
+        }
+
+        return bitmapToFloatArray(maskBitmap, w, h)
     }
 
-    private fun hslToRgb(h: Float, s: Float, l: Float): IntArray {
-        if (s == 0f) {
-            val v = (l * 255).toInt().coerceIn(0, 255)
-            return intArrayOf(v, v, v)
-        }
-        val q = if (l < 0.5f) l * (1f + s) else l + s - l * s
-        val p = 2f * l - q
-        val hNorm = h / 360f
-        fun hue2rgb(t0: Float): Int {
-            var t = t0
-            if (t < 0f) t += 1f; if (t > 1f) t -= 1f
-            val v = when {
-                t < 1f / 6f -> p + (q - p) * 6f * t
-                t < 1f / 2f -> q
-                t < 2f / 3f -> p + (q - p) * (2f / 3f - t) * 6f
-                else         -> p
+    private fun createTieredEyeBagsMask(
+        faceData: FaceData,
+        w: Int, h: Int,
+        blurRadius: Float
+    ): Array<FloatArray> {
+        val maskBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(maskBitmap)
+        canvas.drawColor(Color.BLACK)
+
+        fun drawTier(polygons: List<List<Int>>, alphaValue: Int) {
+            val paint = Paint().apply {
+                color = Color.argb(alphaValue, 255, 255, 255)
+                style = Paint.Style.FILL
+                isAntiAlias = true
+                if (blurRadius > 0f) {
+                    maskFilter = BlurMaskFilter(blurRadius, BlurMaskFilter.Blur.NORMAL)
+                }
             }
-            return (v * 255).toInt().coerceIn(0, 255)
+            polygons.forEach { indices ->
+                if (indices.isEmpty()) return@forEach
+                val path = Path()
+                val first = faceData.landmarks[indices[0]]
+                path.moveTo(first.x * w, first.y * h)
+                for (i in 1 until indices.size) {
+                    val lm = faceData.landmarks[indices[i]]
+                    path.lineTo(lm.x * w, lm.y * h)
+                }
+                path.close()
+                canvas.drawPath(path, paint)
+            }
         }
-        return intArrayOf(
-            hue2rgb(hNorm + 1f / 3f),
-            hue2rgb(hNorm),
-            hue2rgb(hNorm - 1f / 3f)
-        )
+        // Draw from largest/dimmest to smallest/brightest
+        drawTier(listOf(LEFT_EYE_BAG_TIER3, RIGHT_EYE_BAG_TIER3), 75)   // ~30% intensity
+        drawTier(listOf(LEFT_EYE_BAG_TIER2, RIGHT_EYE_BAG_TIER2), 150)  // ~60% intensity
+        drawTier(listOf(LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES), 255) // 100% intensity
+
+        return bitmapToFloatArray(maskBitmap, w, h)
     }
 
     // ── Low-level image math ─────────────────────────────────────────────────
+
+    /**
+     * Per-pixel multiply of two same-sized masks (used to combine the
+     * segmentation-based mask with a purely geometric mask).
+     */
+    private fun multiplyMasks(a: Array<FloatArray>, b: Array<FloatArray>): Array<FloatArray> {
+        val h = a.size; val w = if (h > 0) a[0].size else 0
+        return Array(h) { y -> FloatArray(w) { x -> a[y][x] * b[y][x] } }
+    }
 
     /**
      * 3. NEW: Fast separable box blur to feather the 2D FloatArray mask.
@@ -806,6 +882,25 @@ class ApplyBeautyUseCase {
         canvas.drawPath(landmarkPath(FEATURE_LEFT_EYE),  edgePaint(0, 240, 255, 2.5f, 245))
         canvas.drawPath(landmarkPath(FEATURE_RIGHT_EYE), edgePaint(0, 240, 255, 2.5f, 245))
 
+        // Eye bags — light pink/magenta (Tiers 3, 2, and 1)
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_TIER3), fillPaint(255, 105, 180, 50))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_TIER3), fillPaint(255, 105, 180, 50))
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_TIER2), fillPaint(255, 105, 180, 80))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_TIER2), fillPaint(255, 105, 180, 80))
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES), fillPaint(255, 105, 180, 140))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_INDICES), fillPaint(255, 105, 180, 140))
+        canvas.drawPath(landmarkPath(LEFT_EYE_BAG_INDICES), edgePaint(255, 20, 147, 1.5f, 190))
+        canvas.drawPath(landmarkPath(RIGHT_EYE_BAG_INDICES), edgePaint(255, 20, 147, 1.5f, 190))
+
+        // Pupils / iris — cyan/white (needs the 478-point mesh with iris
+        // refinement landmarks 468-477; skipped if unavailable).
+        if (lm.size >= 478) {
+            canvas.drawPath(landmarkPath(LEFT_IRIS_INDICES),  fillPaint(255, 255, 255, 210))
+            canvas.drawPath(landmarkPath(RIGHT_IRIS_INDICES), fillPaint(255, 255, 255, 210))
+            canvas.drawPath(landmarkPath(LEFT_IRIS_INDICES),  edgePaint(0, 240, 255, 1.5f, 245))
+            canvas.drawPath(landmarkPath(RIGHT_IRIS_INDICES), edgePaint(0, 240, 255, 1.5f, 245))
+        }
+
         // ── 3. All 468 landmark dots ─────────────────────────────────────────
         val dotPaint  = Paint().apply {
             color = Color.argb(210, 255, 255, 255)
@@ -825,6 +920,8 @@ class ApplyBeautyUseCase {
         val entries = listOf(
             Color.argb(220, 0,   200, 80)  to "Skin (smoothed)",
             Color.argb(220, 0,   200, 220) to "Eyes",
+            Color.argb(220, 255, 255, 255) to "Pupils",
+            Color.argb(220, 255, 20,  147) to "Eye Bags",
             Color.argb(220, 255, 152, 0)   to "Eyebrows",
             Color.argb(220, 233, 30,  99)  to "Lips",
             Color.argb(220, 255, 235, 59)  to "Mouth / teeth",
@@ -980,8 +1077,37 @@ class ApplyBeautyUseCase {
         /** Nose base / nostril flare area (8 points). */
         private val FEATURE_NOSE_BASE   = listOf(4, 45, 51, 5, 281, 275, 440, 220)
 
-        // ── Under-eye bag geometry (MediaPipe FaceMesh landmark indices) ─────────
-        // Tier 2: Full outer edge included to close the corner gap
+        // ── Eyes (canonical MediaPipe eye contour indices) — used only for
+        // mask subtraction, to carve the eyeball/lash line back out of the
+        // heavily-blurred eye-bag mask.
+        /** Left eye contour (16 points). */
+        val LEFT_EYE_INDICES  = FEATURE_LEFT_EYE
+        /** Right eye contour (16 points). */
+        val RIGHT_EYE_INDICES = FEATURE_RIGHT_EYE
+
+        // ── Iris & pupil (canonical MediaPipe iris refinement indices) ────────
+        // Perimeter-only (center pupil dot omitted): including the center
+        // point made path.close() fold inward into a star/bowtie shape
+        // instead of a clean round pupil.
+        /** Left iris ring — perimeter only: Right, Top, Left, Bottom. */
+        private val LEFT_IRIS_INDICES = listOf(469, 470, 471, 472)
+        /** Right iris ring — perimeter only: Right, Top, Left, Bottom. */
+        private val RIGHT_IRIS_INDICES = listOf(474, 475, 476, 477)
+
+        // ── Eye bags (canonical MediaPipe crescent contour indices) ───────────
+        // Corrected Left Eye Bag (Lower lid outer->inner, then cheek inner->outer)
+        private val LEFT_EYE_BAG_INDICES = listOf(
+            33, 7, 163, 144, 145, 153, 154, 155, 133,
+            112, 26, 22, 23, 24, 110, 25, 226, 130
+        )
+
+        // Corrected Right Eye Bag (Lower lid inner->outer, then cheek outer->inner)
+        private val RIGHT_EYE_BAG_INDICES = listOf(
+            362, 382, 381, 380, 374, 373, 390, 249, 263,
+            359, 446, 255, 339, 254, 253, 252, 256, 341
+        )
+
+        // Tier 2: Full wrap-around cheek loop
         private val LEFT_EYE_BAG_TIER2 = listOf(
             112, 26, 22, 23, 24, 110, 25, 226, 130, // Inner to Outer (Top edge)
             227, 31, 228, 229, 230, 231, 232, 233, 244  // Outer to Inner (Bottom edge)
@@ -991,32 +1117,34 @@ class ApplyBeautyUseCase {
             447, 261, 448, 449, 450, 451, 452, 453, 464
         )
 
-        // Tier 3: Full top edge included, but drops 143/372 from the bottom to prevent the spike
+        // Tier 3: Full wrap-around cheek loop
         private val LEFT_EYE_BAG_TIER3 = listOf(
-            244, 233, 232, 231, 230, 229, 228, 31, 227, // Inner to Outer (Top edge)
-            111, 117, 118, 119, 120, 121, 128, 245 // Outer to Inner (Bottom edge - tapers at 111)
+            244, 233, 232, 231, 230, 229, 228, 31, 227,
+            143, 111, 117, 118, 119, 120, 121, 128, 245
         )
         private val RIGHT_EYE_BAG_TIER3 = listOf(
             464, 453, 452, 451, 450, 449, 448, 261, 447,
-            340, 346, 347, 348, 349, 350, 357, 465 // Outer to Inner (Bottom edge - tapers at 340)
+            372, 340, 346, 347, 348, 349, 350, 357, 465
         )
 
         // Skin smoothing
-        private const val MASK_THRESHOLD            = 0.3f
+        private const val MASK_THRESHOLD            = 0.2f
         private const val MAX_BILATERAL_RADIUS      = 6       
         private const val BILATERAL_SPATIAL_SIGMA   = 3f       
         private const val BILATERAL_COLOR_SIGMA     = 30f      
         private const val TEXTURE_PRESERVE_AMOUNT   = 0.28f    
 
-        // Brightness
-        private const val MAX_LIGHTNESS_LIFT        = 0.12f    
+        // Brightness — max Screen-blend lift amount (0-255 integer scale)
+        private const val MAX_BRIGHTNESS_LIFT       = 50f
 
         // Eye brightness
         private const val MAX_EYE_LIFT              = 40f      
+        private const val IRIS_BLUR_RADIUS          = 4f
 
-        // Blemish reduction
-        private const val BLEMISH_BLUR_RADIUS       = 8
-        private const val BLEMISH_DARK_THRESHOLD    = 20f
+        // Under-eye / eye-bag reduction
+        private const val MAX_UNDER_EYE_LIFT        = 100f
+        private const val EYE_BAG_BLUR_RADIUS       = 30f
+        private const val EYES_BLUR_RADIUS          = 2f
 
         // Sharpening
         private const val SHARPEN_BLUR_RADIUS       = 2
