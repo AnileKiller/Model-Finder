@@ -375,23 +375,21 @@ class ApplyBeautyUseCase {
 
                 val idx = y * w + x
                 val p = pixels[idx]
-                val currentLuma = luma(p)
+                val currentLuma = maxOf(luma(p), 1f) // Prevent division by zero
 
-                // 3. Additive Brightness Lift
-                // How much room is left before we hit the absolute cap?
                 val availableLift = maxOf(0f, lumaCap - currentLuma)
-
-                // Throttle the requested lift by the mask intensity, but never exceed the cap
                 val actualLift = minOf(maxLift * rawMask, availableLift)
 
                 if (actualLift <= 0f) continue
 
-                val a = p ushr 24
-                val r = ((p shr 16 and 0xFF) + actualLift).toInt().coerceIn(0, 255)
-                val g = ((p shr 8  and 0xFF) + actualLift).toInt().coerceIn(0, 255)
-                val b = ((p        and 0xFF) + actualLift).toInt().coerceIn(0, 255)
+                // PROPORTIONAL SCALING: Preserves skin hue and saturation perfectly
+                val scale = (currentLuma + actualLift) / currentLuma
 
-                // Directly apply the lifted pixel (no complex blend needed because actualLift handles the gradient natively)
+                val a = p ushr 24
+                val r = ((p shr 16 and 0xFF) * scale).toInt().coerceIn(0, 255)
+                val g = ((p shr 8  and 0xFF) * scale).toInt().coerceIn(0, 255)
+                val b = ((p        and 0xFF) * scale).toInt().coerceIn(0, 255)
+
                 pixels[idx] = (a shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
@@ -1106,24 +1104,24 @@ class ApplyBeautyUseCase {
             359, 446, 255, 339, 254, 253, 252, 256, 341
         )
 
-        // Tier 2: Connects the bottom of Tier 1 to the next row down on the cheek
+        // Tier 2: Truncated outer edges to prevent temple spikes
         private val LEFT_EYE_BAG_TIER2 = listOf(
-            112, 26, 22, 23, 24, 110, 25, 226, 130, // Inner to Outer (Top edge)
-            227, 31, 228, 229, 230, 231, 232, 233, 244  // Outer to Inner (Bottom edge)
+            112, 26, 22, 23, 24, 110, 25, // Inner to Outer (Top edge)
+            31, 228, 229, 230, 231, 232, 233, 244  // Outer to Inner (Bottom edge)
         )
         private val RIGHT_EYE_BAG_TIER2 = listOf(
-            341, 256, 252, 253, 254, 339, 255, 446, 359, // Inner to Outer (Top edge)
-            447, 261, 448, 449, 450, 451, 452, 453, 464  // Outer to Inner (Bottom edge)
+            341, 256, 252, 253, 254, 339, 255, // Inner to Outer (Top edge)
+            261, 448, 449, 450, 451, 452, 453, 464  // Outer to Inner (Bottom edge)
         )
 
-        // Tier 3: Connects the bottom of Tier 2 to the next row down on the cheek
+        // Tier 3: Truncated outer edges to prevent temple spikes
         private val LEFT_EYE_BAG_TIER3 = listOf(
-            244, 233, 232, 231, 230, 229, 228, 31, 227, // Inner to Outer (Top edge)
-            143, 111, 117, 118, 119, 120, 121, 128, 245 // Outer to Inner (Bottom edge)
+            244, 233, 232, 231, 230, 229, 228, 31, // Inner to Outer (Top edge)
+            111, 117, 118, 119, 120, 121, 128, 245 // Outer to Inner (Bottom edge)
         )
         private val RIGHT_EYE_BAG_TIER3 = listOf(
-            464, 453, 452, 451, 450, 449, 448, 261, 447, // Inner to Outer (Top edge)
-            372, 340, 346, 347, 348, 349, 350, 357, 465  // Outer to Inner (Bottom edge)
+            464, 453, 452, 451, 450, 449, 448, 261, // Inner to Outer (Top edge)
+            340, 346, 347, 348, 349, 350, 357, 465  // Outer to Inner (Bottom edge)
         )
 
         // Skin smoothing
