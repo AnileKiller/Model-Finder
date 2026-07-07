@@ -86,7 +86,7 @@ class ApplyBeautyUseCase {
                 faceData, listOf(LEFT_EYE_INDICES, RIGHT_EYE_INDICES),
                 source.width, source.height, EYES_BLUR_RADIUS
             )
-            
+
             // Combine all tiers for a massive, full-coverage containment zone
             val allBagTiers = listOf(
                 LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES,
@@ -96,7 +96,7 @@ class ApplyBeautyUseCase {
             val eyeBagsMask = createFeatureMask(
                 faceData, allBagTiers, source.width, source.height, 20f
             )
-            
+
             result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, refinedMask, effective.underEyeReduction)
         }
 
@@ -285,10 +285,17 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        val narrowRadius = (w * 0.008f).toInt().coerceIn(2, 10)
-        val wideRadius   = (w * 0.05f).toInt().coerceIn(15, 45)
+        // 1. DRAMATICALLY REDUCE BLUR RADII
+        // We only want to blur the tiny blemish spot, not the whole cheek.
+        val narrowRadius = (w * 0.002f).toInt().coerceIn(1, 4) // Was up to 10, now max 4.
+        val wideRadius = (w * 0.02f).toInt().coerceIn(5, 15) // Was up to 45, now max 15.
         val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
-        val blurWide   = gaussianBlur(pixels, w, h, wideRadius)
+        val blurWide = gaussianBlur(pixels, w, h, wideRadius)
+
+        // We need the original source to preserve pores
+        val result = src.copy(Bitmap.Config.ARGB_8888, true)
+        val outPixels = IntArray(w * h)
+        result.getPixels(outPixels, 0, w, 0, 0, w, h)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -296,36 +303,51 @@ class ApplyBeautyUseCase {
                 if (maskVal < MASK_THRESHOLD) continue
 
                 val idx = y * w + x
-                val p = pixels[idx]
-                val target = blurWide[idx]
+                val original = pixels[idx]
+                val target = blurWide[idx] // The "average" surrounding skin
                 val narrow = blurNarrow[idx]
 
-                val targetLuma = maxOf(luma(target), 5f)
+                val originalLuma = luma(original)
+                val targetLuma = luma(target)
                 val narrowLuma = luma(narrow)
 
-                // 1. Relative Contrast Ratio (Crucial for dark skin tones)
-                val contrastRatio = kotlin.math.abs(narrowLuma - targetLuma) / targetLuma
-                // Triggers if contrast deviates by 4% to 15% from local skin
-                val contrastLikeness = smoothstep(0.04f, 0.15f, contrastRatio)
+                // 2. REDESIGNED CONTRAST DETECTION
+                // Use Absolute difference, not ratio, to handle dark skin tones perfectly.
+                val contrastDiff = kotlin.math.abs(narrowLuma - targetLuma)
+                val contrastLikeness = smoothstep(1f, 10f, contrastDiff) // Much tighter threshold
 
-                // 2. Relative Redness (Active acne)
+                // Relative Redness
                 val nR = narrow shr 16 and 0xFF; val nG = narrow shr 8 and 0xFF
                 val tR = target shr 16 and 0xFF; val tG = target shr 8 and 0xFF
-                val redLikeness = smoothstep(4f, 15f, (nR - nG.toFloat()) - (tR - tG.toFloat()))
+                val redLikeness = smoothstep(3f, 12f, (nR - nG.toFloat()) - (tR - tG.toFloat()))
 
                 val blemishLikeness = maxOf(contrastLikeness, redLikeness)
 
-                // Protect massive shadows/edges (nostrils, jawline gaps)
-                val edgeProtection = 1f - smoothstep(0.25f, 0.45f, contrastRatio)
+                // 3. CRITICAL: EDGE PROTECTION 
+                // If the original pixel is a strong edge (e.g., shadow contour), don't touch it.
+                // We calculate edge strength using the original vs the wide blur.
+                val edgeStrength = kotlin.math.abs(originalLuma - targetLuma)
+                val edgeProtection = 1f - smoothstep(10f, 30f, edgeStrength)
 
-                val finalAlpha = blemishLikeness * edgeProtection * maskVal * strength
+                var finalAlpha = blemishLikeness * edgeProtection * maskVal * strength
+                finalAlpha = finalAlpha.coerceIn(0f, 0.85f) // Cap max strength to prevent plastic look
                 if (finalAlpha <= 0.01f) continue
 
-                pixels[idx] = blendPixel(p, target, finalAlpha)
+                // 4. TEXTURE-PRESERVING BLEND (The most important fix)
+                // Instead of replacing the pixel with 'target', we mix the DETAIL back in!
+                // If original = 100, Target = 80, we want to move to 85, NOT 80.
+                val blendR = (original shr 16 and 0xFF) + ((target shr 16 and 0xFF) - (original shr 16 and 0xFF)) * finalAlpha
+                val blendG = (original shr 8 and 0xFF) + ((target shr 8 and 0xFF) - (original shr 8 and 0xFF)) * finalAlpha
+                val blendB = (original and 0xFF) + ((target and 0xFF) - (original and 0xFF)) * finalAlpha
+
+                val a = original ushr 24
+                outPixels[idx] = (a shl 24) or 
+                        (blendR.toInt().coerceIn(0, 255) shl 16) or 
+                        (blendG.toInt().coerceIn(0, 255) shl 8) or 
+                        blendB.toInt().coerceIn(0, 255)
             }
         }
-        val result = src.copy(Bitmap.Config.ARGB_8888, true)
-        result.setPixels(pixels, 0, w, 0, 0, w, h)
+        result.setPixels(outPixels, 0, w, 0, 0, w, h)
         return result
     }
 
@@ -347,7 +369,7 @@ class ApplyBeautyUseCase {
                 (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f) * skinMask[y][x]
             }
         }
-        
+
         // 2. Feather the mask edge gently
         val featheredRawMask = preBlurMask(rawMaskArray, w, h, 3)
 
@@ -375,7 +397,7 @@ class ApplyBeautyUseCase {
                 val warmRed = (nr + (adaptiveLift * 0.15f)).toInt().coerceIn(0, 255)
 
                 val enhanced = (a shl 24) or (warmRed shl 16) or (ng.coerceIn(0, 255) shl 8) or nb.coerceIn(0, 255)
-                
+
                 pixels[idx] = blendPixel(p, enhanced, maskVal * strength * shadowFactor)
             }
         }
@@ -897,26 +919,26 @@ class ApplyBeautyUseCase {
             // Drop shadow removed to prevent smearing
         }
         val dotR = (w * 0.0025f).coerceIn(1.5f, 4f)
-        
+
         // Reference points for our bounding box
         val noseTip = lm[4]
         val leftEye = lm[159]
         val rightEye = lm[386]
         val upperLip = lm[0]
         val eyeBaseline = minOf(leftEye.y, rightEye.y) + 0.03f
-        
+
         for ((index, l) in lm.withIndex()) {
             val px = l.x * w
             val py = l.y * h
             canvas.drawCircle(px, py, dotR, dotPaint)
-            
+
             // FILTER: Only draw text in the cheek areas to prevent a massive blob of text
             val isBelowEyes = l.y > eyeBaseline
             val isAboveLip = l.y < upperLip.y
             // Exclude the highly dense nose bridge/tip area
             val distToNoseX = kotlin.math.abs(l.x - noseTip.x)
             val isNotNose = distToNoseX > 0.06f 
-            
+
             if (isBelowEyes && isAboveLip && isNotNose) {
                 canvas.drawText(index.toString(), px + 3f, py - 3f, textPaint)
             }
