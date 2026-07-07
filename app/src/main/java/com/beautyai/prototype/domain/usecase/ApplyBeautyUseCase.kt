@@ -75,7 +75,17 @@ class ApplyBeautyUseCase {
                 faceData, listOf(LEFT_EYE_INDICES, RIGHT_EYE_INDICES),
                 source.width, source.height, EYES_BLUR_RADIUS
             )
-            val eyeBagsMask = createTieredEyeBagsMask(faceData, source.width, source.height, 6f)
+            
+            // Combine all tiers for a massive, full-coverage containment zone
+            val allBagTiers = listOf(
+                LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES,
+                LEFT_EYE_BAG_TIER2, RIGHT_EYE_BAG_TIER2,
+                LEFT_EYE_BAG_TIER3, RIGHT_EYE_BAG_TIER3
+            )
+            val eyeBagsMask = createFeatureMask(
+                faceData, allBagTiers, source.width, source.height, source.width * 0.04f
+            )
+            
             result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, effective.underEyeReduction)
         }
 
@@ -316,8 +326,9 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. Create the Low-Frequency Illumination Map (approx 40px on a 1000px image)
-        val blurRadius = (w * 0.04f).toInt().coerceIn(15, 60)
+        // 1. Create a WIDER Low-Frequency Illumination Map (approx 80px on a 1000px image)
+        // This ensures the map pulls reference light from the healthy cheek, not just the dark bag.
+        val blurRadius = (w * 0.08f).toInt().coerceIn(30, 100)
         val blurPixels = gaussianBlur(pixels, w, h, blurRadius)
 
         val maxLift = strength * 255f 
@@ -334,14 +345,14 @@ class ApplyBeautyUseCase {
                 val pLuma = luma(p)
                 val blurLuma = luma(blurP)
 
-                // 2. Isolate Negative Shadows (Pixel is darker than local illumination)
+                // 2. Isolate Negative Shadows
                 val shadowDepth = maxOf(0f, blurLuma - pLuma)
                 
-                // If it's not a shadow (e.g., a bright pore or highlight), leave it completely untouched
-                if (shadowDepth <= 2f) continue
+                // Softened floor to catch the edges of the shadow
+                if (shadowDepth <= 1.5f) continue
 
-                // 3. Modulate lift: Deeper shadows get more lift, shallow shadows get less
-                val shadowFactor = smoothstep(5f, 40f, shadowDepth) 
+                // 3. Modulate lift: Softened smoothstep catches broader shadow gradients
+                val shadowFactor = smoothstep(2f, 35f, shadowDepth) 
                 val actualLift = (maxLift * rawMask * shadowFactor).toInt().coerceIn(0, 255)
                 
                 if (actualLift == 0) continue
@@ -351,7 +362,7 @@ class ApplyBeautyUseCase {
                 val g = p shr 8 and 0xFF
                 val b = p and 0xFF
 
-                // 4. Pure Screen Blend (Optical brightening, preserves underlying hue)
+                // 4. Pure Screen Blend
                 val nr = r + actualLift - (r * actualLift) / 255
                 val ng = g + actualLift - (g * actualLift) / 255
                 val nb = b + actualLift - (b * actualLift) / 255
