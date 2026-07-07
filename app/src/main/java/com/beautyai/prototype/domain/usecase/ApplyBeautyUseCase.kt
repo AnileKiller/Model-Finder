@@ -341,18 +341,14 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. Local Illumination Map (Fixes directional lighting & asymmetry)
-        val blurRadius = (w * 0.04f).toInt().coerceIn(15, 60)
-        val blurPixels = gaussianBlur(pixels, w, h, blurRadius)
-
-        // 2. Constrain to skin and combine masks
+        // 1. Constrain to skin and combine masks
         val rawMaskArray = Array(h) { y ->
             FloatArray(w) { x ->
                 (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f) * skinMask[y][x]
             }
         }
         
-        // 3. Feather the mask edge gently
+        // 2. Feather the mask edge gently
         val featheredRawMask = preBlurMask(rawMaskArray, w, h, 3)
 
         for (y in 0 until h) {
@@ -362,41 +358,23 @@ class ApplyBeautyUseCase {
 
                 val idx = y * w + x
                 val p   = pixels[idx]
-                val blurP = blurPixels[idx]
-                
                 val lum = luma(p) 
-                val localLum = luma(blurP)
 
-                // 4. Adaptive Shadow Lifting via Local Contrast
-                val shadowDepth = maxOf(0f, localLum - lum)
-                val shadowFactor = smoothstep(3f, 35f, shadowDepth) 
+                // 3. Adaptive Shadow Lifting: Darker pixels get max lift, highlights get 0.
+                val shadowFactor = smoothstep(0f, 0.5f, 1f - (lum / 255f)) 
 
                 val adaptiveLift = (strength * MAX_UNDER_EYE_LIFT * shadowFactor).toInt()
                 if (adaptiveLift <= 0) continue
 
                 val a = p ushr 24
-                val r = p shr 16 and 0xFF
-                val g = p shr 8  and 0xFF
-                val b = p        and 0xFF
+                val nr = (p shr 16 and 0xFF) + adaptiveLift
+                val ng = (p shr 8  and 0xFF) + adaptiveLift
+                val nb = (p        and 0xFF) + adaptiveLift
 
-                // 5. Dynamic Color Rebalancing
-                val rMinusB = r - b
-                val blueDominance = smoothstep(-30f, 0f, -rMinusB.toFloat())
-                val redBoost = (adaptiveLift * blueDominance * 0.25f).toInt()
+                // 4. Preserve Skin Warmth: Pull the Red channel up slightly faster
+                val warmRed = (nr + (adaptiveLift * 0.15f)).toInt().coerceIn(0, 255)
 
-                var nr = r + adaptiveLift + redBoost
-                var ng = g + adaptiveLift
-                var nb = b + adaptiveLift
-
-                // 6. The "Ashy" Protector
-                if (nr < ng - 10) ng = nr + 10 
-                if (nr < nb - 10) nb = nr + 10 
-
-                nr = nr.coerceIn(0, 255)
-                ng = ng.coerceIn(0, 255)
-                nb = nb.coerceIn(0, 255)
-
-                val enhanced = (a shl 24) or (nr shl 16) or (ng shl 8) or nb
+                val enhanced = (a shl 24) or (warmRed shl 16) or (ng.coerceIn(0, 255) shl 8) or nb.coerceIn(0, 255)
                 
                 pixels[idx] = blendPixel(p, enhanced, maskVal * strength * shadowFactor)
             }
@@ -1205,7 +1183,7 @@ class ApplyBeautyUseCase {
         private const val IRIS_BLUR_RADIUS          = 4f
 
         // Under-eye / eye-bag reduction
-        private const val MAX_UNDER_EYE_LIFT        = 180f // Increased significantly for higher max strength
+        private const val MAX_UNDER_EYE_LIFT        = 60f
         private const val EYE_BAG_BLUR_RADIUS       = 30f
         private const val EYES_BLUR_RADIUS          = 2f
 
