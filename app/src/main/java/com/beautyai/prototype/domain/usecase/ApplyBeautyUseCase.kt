@@ -285,14 +285,14 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. DRAMATICALLY REDUCE BLUR RADII
+        // 1. TINY BLUR RADII
         // We only want to blur the tiny blemish spot, not the whole cheek.
-        val narrowRadius = (w * 0.002f).toInt().coerceIn(1, 4) // Was up to 10, now max 4.
-        val wideRadius = (w * 0.02f).toInt().coerceIn(5, 15) // Was up to 45, now max 15.
-        val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
-        val blurWide = gaussianBlur(pixels, w, h, wideRadius)
+        val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)   // Max 3px
+        val wideRadius   = (w * 0.015f).toInt().coerceIn(4, 12)   // Max 12px
 
-        // We need the original source to preserve pores
+        val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
+        val blurWide   = gaussianBlur(pixels, w, h, wideRadius)
+
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         val outPixels = IntArray(w * h)
         result.getPixels(outPixels, 0, w, 0, 0, w, h)
@@ -304,47 +304,56 @@ class ApplyBeautyUseCase {
 
                 val idx = y * w + x
                 val original = pixels[idx]
-                val target = blurWide[idx] // The "average" surrounding skin
+                val target = blurWide[idx]  
                 val narrow = blurNarrow[idx]
 
-                val originalLuma = luma(original)
-                val targetLuma = luma(target)
-                val narrowLuma = luma(narrow)
+                // Extract RGB
+                val oR = original shr 16 and 0xFF; val oG = original shr 8 and 0xFF; val oB = original and 0xFF
+                val tR = target shr 16 and 0xFF;   val tG = target shr 8 and 0xFF;   val tB = target and 0xFF
+                val nR = narrow shr 16 and 0xFF;   val nG = narrow shr 8 and 0xFF;   val nB = narrow and 0xFF
 
-                // 2. REDESIGNED CONTRAST DETECTION
-                // Use Absolute difference, not ratio, to handle dark skin tones perfectly.
-                val contrastDiff = kotlin.math.abs(narrowLuma - targetLuma)
-                val contrastLikeness = smoothstep(1f, 10f, contrastDiff) // Much tighter threshold
+                // 2. SMART DETECTION (YCbCr Luminance)
+                // Distinguishes actual blemishes from lighting shadows
+                val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
+                val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
+                val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
+                
+                val contrastDiff = kotlin.math.abs(nLuma - tLuma)
+                
+                // 3. REDNESS DETECTION
+                // Active pimples are pure red, which is very low Blue vs Red.
+                val rednessOrig = (oR - oG).toFloat()
+                val rednessTarget = (tR - tG).toFloat()
+                val rednessDiff = rednessOrig - rednessTarget
 
-                // Relative Redness
-                val nR = narrow shr 16 and 0xFF; val nG = narrow shr 8 and 0xFF
-                val tR = target shr 16 and 0xFF; val tG = target shr 8 and 0xFF
-                val redLikeness = smoothstep(3f, 12f, (nR - nG.toFloat()) - (tR - tG.toFloat()))
+                // 4. PROTECT LIGHTING SHADOWS (Crucial for low-light images)
+                // Instead of just looking at edge strength, we protect anything that is 
+                // a strong shadow OR a strong highlight.
+                val shadowLikeness = smoothstep(15f, 40f, oLuma) // Dark pixels get protected
+                val highlightLikeness = smoothstep(180f, 255f, oLuma) // Very bright pixels get protected (preserves glow)
+                val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
 
-                val blemishLikeness = maxOf(contrastLikeness, redLikeness)
+                // 5. CALCULATE FINAL ALPHA
+                val blemishLikeness = maxOf(
+                    smoothstep(3f, 12f, contrastDiff),
+                    smoothstep(5f, 15f, rednessDiff)
+                )
+                
+                var finalAlpha = blemishLikeness * lightProtection * maskVal * strength
+                finalAlpha = finalAlpha.coerceIn(0f, 0.75f) // Cap at 75% to preserve 25% of original texture
 
-                // 3. CRITICAL: EDGE PROTECTION 
-                // If the original pixel is a strong edge (e.g., shadow contour), don't touch it.
-                // We calculate edge strength using the original vs the wide blur.
-                val edgeStrength = kotlin.math.abs(originalLuma - targetLuma)
-                val edgeProtection = 1f - smoothstep(10f, 30f, edgeStrength)
-
-                var finalAlpha = blemishLikeness * edgeProtection * maskVal * strength
-                finalAlpha = finalAlpha.coerceIn(0f, 0.85f) // Cap max strength to prevent plastic look
                 if (finalAlpha <= 0.01f) continue
 
-                // 4. TEXTURE-PRESERVING BLEND (The most important fix)
-                // Instead of replacing the pixel with 'target', we mix the DETAIL back in!
-                // If original = 100, Target = 80, we want to move to 85, NOT 80.
-                val blendR = (original shr 16 and 0xFF) + ((target shr 16 and 0xFF) - (original shr 16 and 0xFF)) * finalAlpha
-                val blendG = (original shr 8 and 0xFF) + ((target shr 8 and 0xFF) - (original shr 8 and 0xFF)) * finalAlpha
-                val blendB = (original and 0xFF) + ((target and 0xFF) - (original and 0xFF)) * finalAlpha
+                // 6. TEXTURE-PRESERVING BLEND
+                val blendR = oR + ((tR - oR) * finalAlpha)
+                val blendG = oG + ((tG - oG) * finalAlpha)
+                val blendB = oB + ((tB - oB) * finalAlpha)
 
                 val a = original ushr 24
                 outPixels[idx] = (a shl 24) or 
-                        (blendR.toInt().coerceIn(0, 255) shl 16) or 
-                        (blendG.toInt().coerceIn(0, 255) shl 8) or 
-                        blendB.toInt().coerceIn(0, 255)
+                    (blendR.toInt().coerceIn(0, 255) shl 16) or 
+                    (blendG.toInt().coerceIn(0, 255) shl 8) or 
+                    blendB.toInt().coerceIn(0, 255)
             }
         }
         result.setPixels(outPixels, 0, w, 0, 0, w, h)
