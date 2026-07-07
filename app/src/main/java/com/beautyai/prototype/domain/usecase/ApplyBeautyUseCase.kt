@@ -41,6 +41,17 @@ class ApplyBeautyUseCase {
             multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 12
         )
 
+        // ADD THIS — prevents bilateral filter from smearing under-eye skin
+        val eyeBagExcludedSmoothMask = punchRegionsIntoMask(
+            smoothMask, faceData,
+            listOf(
+                LEFT_EYE_BAG_TIER3, RIGHT_EYE_BAG_TIER3,
+                LEFT_EYE_BAG_TIER2, RIGHT_EYE_BAG_TIER2,
+                LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES
+            ),
+            source.width, source.height
+        )
+
         // 3b. Sharp mask — face oval only, with the same eye/brow/lip/nostril
         // holes punched out. No segmentation/neck contribution at all, so
         // detail-sensitive effects never touch body-skin or the hand.
@@ -54,7 +65,7 @@ class ApplyBeautyUseCase {
             result = applyFaceSharpening(result, faceData, sharpMask, effective.faceSharpening)
 
         if (effective.skinSmoothing > 0f)
-            result = applySkinSmoothing(result, smoothMask, effective.skinSmoothing)
+            result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
 
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, sharpMask, effective.blemishReduction)
@@ -86,7 +97,7 @@ class ApplyBeautyUseCase {
                 faceData, allBagTiers, source.width, source.height, source.width * 0.04f
             )
             
-            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, effective.underEyeReduction)
+            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, refinedMask, effective.underEyeReduction)
         }
 
         if (effective.eyeBrightness > 0f) {
@@ -320,54 +331,38 @@ class ApplyBeautyUseCase {
 
 
     private fun applyUnderEyeReduction(
-        src: Bitmap, bagsMask: Array<FloatArray>, eyesMask: Array<FloatArray>, strength: Float
+        src: Bitmap,
+        bagsMask: Array<FloatArray>,
+        eyesMask: Array<FloatArray>,
+        skinMask: Array<FloatArray>,
+        strength: Float
     ): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. Create a WIDER Low-Frequency Illumination Map (approx 80px on a 1000px image)
-        // This ensures the map pulls reference light from the healthy cheek, not just the dark bag.
-        val blurRadius = (w * 0.08f).toInt().coerceIn(30, 100)
-        val blurPixels = gaussianBlur(pixels, w, h, blurRadius)
-
-        val maxLift = strength * 255f 
+        val liftAmount = (strength * MAX_UNDER_EYE_LIFT).toInt().coerceIn(0, 255)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
+                // Crescent mask minus eye contour
                 val rawMask = (bagsMask[y][x] - eyesMask[y][x]).coerceAtLeast(0f)
                 if (rawMask <= 0.01f) continue
 
                 val idx = y * w + x
-                val p = pixels[idx]
-                val blurP = blurPixels[idx]
+                val p   = pixels[idx]
+                val a   = p ushr 24
+                val r   = p shr 16 and 0xFF
+                val g   = p shr 8  and 0xFF
+                val b   = p        and 0xFF
 
-                val pLuma = luma(p)
-                val blurLuma = luma(blurP)
+                // Pure screen blend — no blur, no shadow detection, texture fully preserved
+                val nr = 255 - ((255 - r) * (255 - liftAmount)) / 255
+                val ng = 255 - ((255 - g) * (255 - liftAmount)) / 255
+                val nb = 255 - ((255 - b) * (255 - liftAmount)) / 255
 
-                // 2. Isolate Negative Shadows
-                val shadowDepth = maxOf(0f, blurLuma - pLuma)
-                
-                // Softened floor to catch the edges of the shadow
-                if (shadowDepth <= 1.5f) continue
-
-                // 3. Modulate lift: Softened smoothstep catches broader shadow gradients
-                val shadowFactor = smoothstep(2f, 35f, shadowDepth) 
-                val actualLift = (maxLift * rawMask * shadowFactor).toInt().coerceIn(0, 255)
-                
-                if (actualLift == 0) continue
-
-                val a = p ushr 24
-                val r = p shr 16 and 0xFF
-                val g = p shr 8 and 0xFF
-                val b = p and 0xFF
-
-                // 4. Pure Screen Blend
-                val nr = r + actualLift - (r * actualLift) / 255
-                val ng = g + actualLift - (g * actualLift) / 255
-                val nb = b + actualLift - (b * actualLift) / 255
-                
-                pixels[idx] = (a shl 24) or (nr shl 16) or (ng shl 8) or nb
+                val enhanced = (a shl 24) or (nr shl 16) or (ng shl 8) or nb
+                pixels[idx] = blendPixel(p, enhanced, rawMask * strength)
             }
         }
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
@@ -969,6 +964,35 @@ class ApplyBeautyUseCase {
      * smoothing and blemish-reduction loops skip them instantly via the
      * MASK_THRESHOLD check — no extra per-pixel logic required.
      */
+    private fun punchRegionsIntoMask(
+        baseMask: Array<FloatArray>,
+        faceData: FaceData,
+        regionGroups: List<List<Int>>,
+        w: Int,
+        h: Int
+    ): Array<FloatArray> {
+        val maskBitmap = floatArrayToBitmap(baseMask, w, h)
+        val canvas = Canvas(maskBitmap)
+        val eraserPaint = Paint().apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+        regionGroups.forEach { indices ->
+            if (indices.isEmpty()) return@forEach
+            val path = Path()
+            val first = faceData.landmarks[indices[0]]
+            path.moveTo(first.x * w, first.y * h)
+            for (i in 1 until indices.size) {
+                val lm = faceData.landmarks[indices[i]]
+                path.lineTo(lm.x * w, lm.y * h)
+            }
+            path.close()
+            canvas.drawPath(path, eraserPaint)
+        }
+        return bitmapToFloatArray(maskBitmap, w, h)
+    }
+
     private fun punchExclusionZones(
         baseMask: Array<FloatArray>,
         faceData: FaceData,
@@ -1145,7 +1169,7 @@ class ApplyBeautyUseCase {
         private const val IRIS_BLUR_RADIUS          = 4f
 
         // Under-eye / eye-bag reduction
-        private const val MAX_UNDER_EYE_LIFT        = 100f
+        private const val MAX_UNDER_EYE_LIFT        = 60f
         private const val EYE_BAG_BLUR_RADIUS       = 30f
         private const val EYES_BLUR_RADIUS          = 2f
 
