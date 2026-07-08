@@ -286,26 +286,21 @@ class ApplyBeautyUseCase {
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
         // 1. TINY BLUR RADII
-        // We only want to blur the tiny blemish spot, not the whole cheek.
         val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)   // Max 3px
         val wideRadius   = (w * 0.015f).toInt().coerceIn(4, 12)   // Max 12px
 
         val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
         val blurWide   = gaussianBlur(pixels, w, h, wideRadius)
 
-        val result = src.copy(Bitmap.Config.ARGB_8888, true)
-        val outPixels = IntArray(w * h)
-        result.getPixels(outPixels, 0, w, 0, 0, w, h)
+        // 2. CREATE THE OUTPUT ARRAY DIRECTLY FROM THE SOURCE PIXELS
+        val finalPixels = IntArray(w * h)
+        src.getPixels(finalPixels, 0, w, 0, 0, w, h)
 
-        // 2. FIX: Use strength as a global multiplier for the whole effect, NOT a per-pixel alpha multiplier
-        // We apply it at the very end, purely to control the blend intensity.
         val globalEffectIntensity = strength.coerceIn(0f, 1f)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
-                // 3. FIX: We do NOT multiply the mask by strength here. 
-                // The mask is just a geometric gate (0.0 to 1.0).
                 if (maskVal < 0.1f) continue 
 
                 val idx = y * w + x
@@ -313,59 +308,50 @@ class ApplyBeautyUseCase {
                 val target = blurWide[idx]  
                 val narrow = blurNarrow[idx]
 
-                // Extract RGB
                 val oR = original shr 16 and 0xFF; val oG = original shr 8 and 0xFF; val oB = original and 0xFF
                 val tR = target shr 16 and 0xFF;   val tG = target shr 8 and 0xFF;   val tB = target and 0xFF
                 val nR = narrow shr 16 and 0xFF;   val nG = narrow shr 8 and 0xFF;   val nB = narrow and 0xFF
 
-                // 2. SMART DETECTION (YCbCr Luminance)
                 val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
                 val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
                 val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
                 
                 val contrastDiff = kotlin.math.abs(nLuma - tLuma)
                 
-                // 3. REDNESS DETECTION
                 val rednessOrig = (oR - oG).toFloat()
                 val rednessTarget = (tR - tG).toFloat()
                 val rednessDiff = rednessOrig - rednessTarget
 
-                // 4. PROTECT LIGHTING SHADOWS
                 val shadowLikeness = smoothstep(15f, 40f, oLuma) 
                 val highlightLikeness = smoothstep(180f, 255f, oLuma)
                 val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
 
-                // 5. CALCULATE DETECTION ALPHA (This is raw detection, NOT strength dependent)
                 val blemishLikeness = maxOf(
                     smoothstep(3f, 12f, contrastDiff),
                     smoothstep(5f, 15f, rednessDiff)
                 )
                 
-                // 6. FIX: Properly combine with mask and global strength
-                // First combine detection and geometry
                 var localAlpha = blemishLikeness * lightProtection * maskVal
-                // Then apply the strength slider globally (0.0 to 1.0)
                 var finalAlpha = localAlpha * globalEffectIntensity
-                
-                // 7. FIX: Relax the cap so it can actually reach the effect
-                // We cap at 80% to preserve texture, but allow it to actually get there!
                 finalAlpha = finalAlpha.coerceIn(0f, 0.80f) 
 
                 if (finalAlpha <= 0.01f) continue
 
-                // 8. TEXTURE-PRESERVING BLEND
                 val blendR = oR + ((tR - oR) * finalAlpha)
                 val blendG = oG + ((tG - oG) * finalAlpha)
                 val blendB = oB + ((tB - oB) * finalAlpha)
 
                 val a = original ushr 24
-                outPixels[idx] = (a shl 24) or 
+                finalPixels[idx] = (a shl 24) or 
                     (blendR.toInt().coerceIn(0, 255) shl 16) or 
                     (blendG.toInt().coerceIn(0, 255) shl 8) or 
                     blendB.toInt().coerceIn(0, 255)
             }
         }
-        result.setPixels(outPixels, 0, w, 0, 0, w, h)
+
+        // 3. CREATE THE RESULT BITMAP DIRECTLY FROM THE MODIFIED PIXELS
+        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        result.setPixels(finalPixels, 0, w, 0, 0, w, h)
         return result
     }
 
