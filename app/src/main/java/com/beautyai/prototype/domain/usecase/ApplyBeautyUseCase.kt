@@ -52,13 +52,10 @@ class ApplyBeautyUseCase {
             source.width, source.height
         )
 
-        // 3b. Sharp mask — face oval only, with the same eye/brow/lip/nostril
-        // holes punched out. No segmentation/neck contribution at all, so
-        // detail-sensitive effects never touch body-skin or the hand.
-        val sharpMask = preBlurMask(
-            punchExclusionZones(faceOvalMask, faceData, source.width, source.height),
-            source.width, source.height, 12
-        )
+        // 3b. Sharp mask — face oval only (no exclusion zones, just a soft geometric mask)
+        // We do NOT punch exclusion zones because the blemish reduction logic itself 
+        // uses redness/contrast detection to avoid eyes and lips naturally.
+        val sharpMask = preBlurMask(faceOvalMask, source.width, source.height, 12)
 
         // Sharpening first — works on original, unmodified detail
         if (effective.faceSharpening > 0f)
