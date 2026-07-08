@@ -67,16 +67,6 @@ class ApplyBeautyUseCase {
         if (effective.skinSmoothing > 0f)
             result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
 
-        // --- DEBUG: CHECK THE MASK ---
-        var maxMaskVal = 0f
-        for (y in 0 until sharpMask.size) {
-            for (x in 0 until sharpMask[0].size) {
-                if (sharpMask[y][x] > maxMaskVal) maxMaskVal = sharpMask[y][x]
-            }
-        }
-        android.util.Log.d("BLEMISH_DEBUG", "Max sharpMask value: $maxMaskVal")
-        // ----------------------------
-
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, sharpMask, effective.blemishReduction)
 
@@ -329,7 +319,8 @@ class ApplyBeautyUseCase {
                 val rednessTarget = (tR - tG).toFloat()
                 val rednessDiff = rednessOrig - rednessTarget
 
-                val shadowLikeness = smoothstep(15f, 40f, oLuma) 
+                // CORRECTED: Now 1.0 for deep shadows, 0.0 for normal/mid-tone skin
+                val shadowLikeness = 1f - smoothstep(15f, 40f, oLuma)
                 val highlightLikeness = smoothstep(180f, 255f, oLuma)
                 val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
 
