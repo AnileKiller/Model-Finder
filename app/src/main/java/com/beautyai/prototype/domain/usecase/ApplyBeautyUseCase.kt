@@ -297,10 +297,16 @@ class ApplyBeautyUseCase {
         val outPixels = IntArray(w * h)
         result.getPixels(outPixels, 0, w, 0, 0, w, h)
 
+        // 2. FIX: Use strength as a global multiplier for the whole effect, NOT a per-pixel alpha multiplier
+        // We apply it at the very end, purely to control the blend intensity.
+        val globalEffectIntensity = strength.coerceIn(0f, 1f)
+
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
-                if (maskVal < MASK_THRESHOLD) continue
+                // 3. FIX: We do NOT multiply the mask by strength here. 
+                // The mask is just a geometric gate (0.0 to 1.0).
+                if (maskVal < 0.1f) continue 
 
                 val idx = y * w + x
                 val original = pixels[idx]
@@ -313,7 +319,6 @@ class ApplyBeautyUseCase {
                 val nR = narrow shr 16 and 0xFF;   val nG = narrow shr 8 and 0xFF;   val nB = narrow and 0xFF
 
                 // 2. SMART DETECTION (YCbCr Luminance)
-                // Distinguishes actual blemishes from lighting shadows
                 val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
                 val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
                 val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
@@ -321,30 +326,34 @@ class ApplyBeautyUseCase {
                 val contrastDiff = kotlin.math.abs(nLuma - tLuma)
                 
                 // 3. REDNESS DETECTION
-                // Active pimples are pure red, which is very low Blue vs Red.
                 val rednessOrig = (oR - oG).toFloat()
                 val rednessTarget = (tR - tG).toFloat()
                 val rednessDiff = rednessOrig - rednessTarget
 
-                // 4. PROTECT LIGHTING SHADOWS (Crucial for low-light images)
-                // Instead of just looking at edge strength, we protect anything that is 
-                // a strong shadow OR a strong highlight.
-                val shadowLikeness = smoothstep(15f, 40f, oLuma) // Dark pixels get protected
-                val highlightLikeness = smoothstep(180f, 255f, oLuma) // Very bright pixels get protected (preserves glow)
+                // 4. PROTECT LIGHTING SHADOWS
+                val shadowLikeness = smoothstep(15f, 40f, oLuma) 
+                val highlightLikeness = smoothstep(180f, 255f, oLuma)
                 val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
 
-                // 5. CALCULATE FINAL ALPHA
+                // 5. CALCULATE DETECTION ALPHA (This is raw detection, NOT strength dependent)
                 val blemishLikeness = maxOf(
                     smoothstep(3f, 12f, contrastDiff),
                     smoothstep(5f, 15f, rednessDiff)
                 )
                 
-                var finalAlpha = blemishLikeness * lightProtection * maskVal * strength
-                finalAlpha = finalAlpha.coerceIn(0f, 0.75f) // Cap at 75% to preserve 25% of original texture
+                // 6. FIX: Properly combine with mask and global strength
+                // First combine detection and geometry
+                var localAlpha = blemishLikeness * lightProtection * maskVal
+                // Then apply the strength slider globally (0.0 to 1.0)
+                var finalAlpha = localAlpha * globalEffectIntensity
+                
+                // 7. FIX: Relax the cap so it can actually reach the effect
+                // We cap at 80% to preserve texture, but allow it to actually get there!
+                finalAlpha = finalAlpha.coerceIn(0f, 0.80f) 
 
                 if (finalAlpha <= 0.01f) continue
 
-                // 6. TEXTURE-PRESERVING BLEND
+                // 8. TEXTURE-PRESERVING BLEND
                 val blendR = oR + ((tR - oR) * finalAlpha)
                 val blendG = oG + ((tG - oG) * finalAlpha)
                 val blendB = oB + ((tB - oB) * finalAlpha)
