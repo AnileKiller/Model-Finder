@@ -285,7 +285,6 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. TINY BLUR RADII
         val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)   // Max 3px
         val wideRadius   = (w * 0.015f).toInt().coerceIn(4, 12)   // Max 12px
 
@@ -294,7 +293,6 @@ class ApplyBeautyUseCase {
 
         val globalEffectIntensity = strength.coerceIn(0f, 1f)
 
-        // We will write directly back into 'pixels' - which came from 'src'
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
@@ -319,28 +317,41 @@ class ApplyBeautyUseCase {
                 val rednessTarget = (tR - tG).toFloat()
                 val rednessDiff = rednessOrig - rednessTarget
 
-                // CORRECTED: Now 1.0 for deep shadows, 0.0 for normal/mid-tone skin
+                // 1. FIX: Shadow likeness now correctly protects dark shadows
                 val shadowLikeness = 1f - smoothstep(15f, 40f, oLuma)
                 val highlightLikeness = smoothstep(180f, 255f, oLuma)
+                
+                // 2. NEW: "Edge Protection" - Stops the blur from bleeding across strong geometric lines
+                // This specifically saves the nose shadow, jawline, and cheek contours.
+                val edgeStrength = kotlin.math.abs(oLuma - tLuma)
+                val edgeProtection = smoothstep(10f, 35f, edgeStrength)
+
+                // Combine protections: If it's a shadow, highlight, OR a strong edge, don't blur it.
                 val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
+                val finalProtection = lightProtection * (1f - edgeProtection)
 
                 val blemishLikeness = maxOf(
                     smoothstep(3f, 12f, contrastDiff),
                     smoothstep(5f, 15f, rednessDiff)
                 )
                 
-                var localAlpha = blemishLikeness * lightProtection * maskVal
+                var localAlpha = blemishLikeness * finalProtection * maskVal
                 var finalAlpha = localAlpha * globalEffectIntensity
-                finalAlpha = finalAlpha.coerceIn(0f, 0.80f) 
+                
+                // 3. FIX: Tighter cap to prevent plastic look
+                finalAlpha = finalAlpha.coerceIn(0f, 0.60f) 
 
                 if (finalAlpha <= 0.01f) continue
 
-                val blendR = oR + ((tR - oR) * finalAlpha)
-                val blendG = oG + ((tG - oG) * finalAlpha)
-                val blendB = oB + ((tB - oB) * finalAlpha)
+                // 4. FIX: "Texture Lock" blending
+                // Instead of replacing, we perform a weighted average.
+                // We force at least 40% of the original pixel to remain.
+                val lockedAlpha = finalAlpha * 0.6f
+                val blendR = (oR * (1f - lockedAlpha)) + (tR * lockedAlpha)
+                val blendG = (oG * (1f - lockedAlpha)) + (tG * lockedAlpha)
+                val blendB = (oB * (1f - lockedAlpha)) + (tB * lockedAlpha)
 
                 val a = original ushr 24
-                // Write directly back into the original 'pixels' array
                 pixels[idx] = (a shl 24) or 
                     (blendR.toInt().coerceIn(0, 255) shl 16) or 
                     (blendG.toInt().coerceIn(0, 255) shl 8) or 
@@ -348,10 +359,7 @@ class ApplyBeautyUseCase {
             }
         }
 
-        // CRITICAL: Write the modified pixels back into the original 'src' bitmap
         src.setPixels(pixels, 0, w, 0, 0, w, h)
-
-        // Return the SAME bitmap that the caller passed in, now modified
         return src
     }
 
