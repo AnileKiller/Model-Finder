@@ -67,6 +67,16 @@ class ApplyBeautyUseCase {
         if (effective.skinSmoothing > 0f)
             result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
 
+        // --- DEBUG: CHECK THE MASK ---
+        var maxMaskVal = 0f
+        for (y in 0 until sharpMask.size) {
+            for (x in 0 until sharpMask[0].size) {
+                if (sharpMask[y][x] > maxMaskVal) maxMaskVal = sharpMask[y][x]
+            }
+        }
+        android.util.Log.d("BLEMISH_DEBUG", "Max sharpMask value: $maxMaskVal")
+        // ----------------------------
+
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, sharpMask, effective.blemishReduction)
 
