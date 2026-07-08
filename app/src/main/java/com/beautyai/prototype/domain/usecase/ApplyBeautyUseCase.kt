@@ -338,6 +338,14 @@ class ApplyBeautyUseCase {
                 // 3. FIX: Tighter cap to prevent plastic look
                 finalAlpha = finalAlpha.coerceIn(0f, 0.60f) 
 
+                // --- DEBUG: Check if we are actually getting any alpha ---
+                if (maskVal > 0.5f && blemishLikeness > 0.1f) {
+                    android.util.Log.d("BLEMISH_DEBUG", 
+                        "Mask: $maskVal, Blemish: $blemishLikeness, EdgeProt: $edgeProtection, FinalAlpha: $finalAlpha"
+                    )
+                }
+                // ---------------------------------------------------------
+
                 if (finalAlpha <= 0.01f) continue
 
                 // 4. FIX: "Texture Lock" blending
