@@ -292,12 +292,9 @@ class ApplyBeautyUseCase {
         val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
         val blurWide   = gaussianBlur(pixels, w, h, wideRadius)
 
-        // 2. CREATE THE OUTPUT ARRAY DIRECTLY FROM THE SOURCE PIXELS
-        val finalPixels = IntArray(w * h)
-        src.getPixels(finalPixels, 0, w, 0, 0, w, h)
-
         val globalEffectIntensity = strength.coerceIn(0f, 1f)
 
+        // We will write directly back into 'pixels' - which came from 'src'
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
@@ -342,17 +339,19 @@ class ApplyBeautyUseCase {
                 val blendB = oB + ((tB - oB) * finalAlpha)
 
                 val a = original ushr 24
-                finalPixels[idx] = (a shl 24) or 
+                // Write directly back into the original 'pixels' array
+                pixels[idx] = (a shl 24) or 
                     (blendR.toInt().coerceIn(0, 255) shl 16) or 
                     (blendG.toInt().coerceIn(0, 255) shl 8) or 
                     blendB.toInt().coerceIn(0, 255)
             }
         }
 
-        // 3. CREATE THE RESULT BITMAP DIRECTLY FROM THE MODIFIED PIXELS
-        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        result.setPixels(finalPixels, 0, w, 0, 0, w, h)
-        return result
+        // CRITICAL: Write the modified pixels back into the original 'src' bitmap
+        src.setPixels(pixels, 0, w, 0, 0, w, h)
+
+        // Return the SAME bitmap that the caller passed in, now modified
+        return src
     }
 
 
