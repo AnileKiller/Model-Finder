@@ -58,6 +58,9 @@ class BeautyViewModel(application: Application) : AndroidViewModel(application) 
     private val _showMaskOverlay = MutableStateFlow(false)
     val showMaskOverlay: StateFlow<Boolean> = _showMaskOverlay.asStateFlow()
 
+    private val _blemishDebugLog = MutableStateFlow("")
+    val blemishDebugLog: StateFlow<String> = _blemishDebugLog.asStateFlow()
+
     // ── Cached analysis results ──────────────────────────────────────────────
 
     /** Holds the last successfully analysed face so slider tweaks don't re-run inference. */
@@ -93,7 +96,12 @@ class BeautyViewModel(application: Application) : AndroidViewModel(application) 
 
                 val enhanced = withContext(Dispatchers.Default) {
                     if (faceData != null) {
-                        applyBeauty(bitmap, faceData, _beautyParams.value)
+                        val logLines = mutableListOf<String>()
+                        val result = applyBeauty(bitmap, faceData, _beautyParams.value) { msg ->
+                            if (logLines.size < 5) logLines.add(msg)
+                        }
+                        if (logLines.isNotEmpty()) _blemishDebugLog.value = logLines.joinToString("\n")
+                        result
                     } else {
                         bitmap
                     }
@@ -136,7 +144,12 @@ class BeautyViewModel(application: Application) : AndroidViewModel(application) 
                 val enhanced = withContext(Dispatchers.Default) {
                     val faceData = cachedFaceData
                     if (faceData != null) {
-                        applyBeauty(current.original, faceData, params)
+                        val logLines = mutableListOf<String>()
+                        val result = applyBeauty(current.original, faceData, params) { msg ->
+                            if (logLines.size < 5) logLines.add(msg)
+                        }
+                        if (logLines.isNotEmpty()) _blemishDebugLog.value = logLines.joinToString("\n")
+                        result
                     } else {
                         current.original
                     }
