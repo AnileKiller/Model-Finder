@@ -16,7 +16,8 @@ class ApplyBeautyUseCase {
     operator fun invoke(
         source: Bitmap,
         faceData: FaceData,
-        params: BeautyParameters
+        params: BeautyParameters,
+        onDebugLog: ((String) -> Unit)? = null
     ): Bitmap {
         val effective = params.withGlobalIntensity()
         var result = source.copy(Bitmap.Config.ARGB_8888, true)
@@ -65,7 +66,7 @@ class ApplyBeautyUseCase {
             result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
 
         if (effective.blemishReduction > 0f)
-            result = applyBlemishReduction(result, sharpMask, effective.blemishReduction)
+            result = applyBlemishReduction(result, sharpMask, effective.blemishReduction, onDebugLog)
 
         if (effective.skinBrightness > 0f)
             result = applySkinBrightness(result, smoothMask, effective.skinBrightness)
@@ -277,7 +278,7 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    private fun applyBlemishReduction(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
+    private fun applyBlemishReduction(src: Bitmap, mask: Array<FloatArray>, strength: Float, onDebugLog: ((String) -> Unit)? = null): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
@@ -340,21 +341,22 @@ class ApplyBeautyUseCase {
 
                 // --- DEBUG: Check if we are actually getting any alpha ---
                 if (maskVal > 0.5f && blemishLikeness > 0.1f) {
-                    android.util.Log.d("BLEMISH_DEBUG", 
-                        "Mask: $maskVal, Blemish: $blemishLikeness, EdgeProt: $edgeProtection, FinalAlpha: $finalAlpha"
+                    val msg = "Mask: %.2f  Blemish: %.2f  EdgeProt: %.2f  FinalAlpha: %.2f".format(
+                        maskVal, blemishLikeness, edgeProtection, finalAlpha
                     )
+                    android.util.Log.d("BLEMISH_DEBUG", msg)
+                    onDebugLog?.invoke(msg)
                 }
                 // ---------------------------------------------------------
 
                 if (finalAlpha <= 0.01f) continue
 
-                // 4. FIX: "Texture Lock" blending
-                // Instead of replacing, we perform a weighted average.
-                // We force at least 40% of the original pixel to remain.
-                val lockedAlpha = finalAlpha * 0.6f
-                val blendR = (oR * (1f - lockedAlpha)) + (tR * lockedAlpha)
-                val blendG = (oG * (1f - lockedAlpha)) + (tG * lockedAlpha)
-                val blendB = (oB * (1f - lockedAlpha)) + (tB * lockedAlpha)
+                // 4. FIX: "Texture Lock" blending - NOW WITH CORRECT MATH
+                // We removed the extra * 0.6f multiplier. 
+                // At 100% strength, this blends 60% to the blur and keeps 40% of the original texture.
+                val blendR = (oR * (1f - finalAlpha)) + (tR * finalAlpha)
+                val blendG = (oG * (1f - finalAlpha)) + (tG * finalAlpha)
+                val blendB = (oB * (1f - finalAlpha)) + (tB * finalAlpha)
 
                 val a = original ushr 24
                 pixels[idx] = (a shl 24) or 
