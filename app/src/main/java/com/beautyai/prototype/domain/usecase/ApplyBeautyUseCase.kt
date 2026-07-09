@@ -351,13 +351,12 @@ class ApplyBeautyUseCase {
 
                 if (finalAlpha <= 0.01f) continue
 
-                // 4. FIX: "Texture Lock" blending
-                // Instead of replacing, we perform a weighted average.
-                // We force at least 40% of the original pixel to remain.
-                val lockedAlpha = finalAlpha * 0.6f
-                val blendR = (oR * (1f - lockedAlpha)) + (tR * lockedAlpha)
-                val blendG = (oG * (1f - lockedAlpha)) + (tG * lockedAlpha)
-                val blendB = (oB * (1f - lockedAlpha)) + (tB * lockedAlpha)
+                // 4. FIX: "Texture Lock" blending - NOW WITH CORRECT MATH
+                // We removed the extra * 0.6f multiplier. 
+                // At 100% strength, this blends 60% to the blur and keeps 40% of the original texture.
+                val blendR = (oR * (1f - finalAlpha)) + (tR * finalAlpha)
+                val blendG = (oG * (1f - finalAlpha)) + (tG * finalAlpha)
+                val blendB = (oB * (1f - finalAlpha)) + (tB * finalAlpha)
 
                 val a = original ushr 24
                 pixels[idx] = (a shl 24) or 
