@@ -39,6 +39,7 @@ fun MainScreen(
     showOriginal: Boolean,
     showMaskOverlay: Boolean,
     saveSuccess: String?,
+    blemishDebugLog: String,
     onSelectImage: () -> Unit,
     onParamsChange: (BeautyParameters) -> Unit,
     onReset: () -> Unit,
@@ -137,6 +138,31 @@ fun MainScreen(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(if (showOriginal) "Show Enhanced" else "Compare Original")
+                }
+
+                // Blemish debug log card — shown whenever there are debug messages
+                if (blemishDebugLog.isNotEmpty()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant
+                        ),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(
+                                text = "Blemish Debug (first 5 hits)",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                            Text(
+                                text = blemishDebugLog,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                            )
+                        }
+                    }
                 }
 
                 // Mask overlay debug toggle — only shown when a face was detected
