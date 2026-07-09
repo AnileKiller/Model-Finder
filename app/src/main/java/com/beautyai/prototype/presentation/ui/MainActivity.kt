@@ -50,6 +50,7 @@ class MainActivity : ComponentActivity() {
                 val showOriginal     by viewModel.showOriginal.collectAsState()
                 val showMaskOverlay  by viewModel.showMaskOverlay.collectAsState()
                 val saveSuccess      by viewModel.saveSuccess.collectAsState()
+                val blemishDebugLog  by viewModel.blemishDebugLog.collectAsState()
 
                 MainScreen(
                     processingState     = processingState,
@@ -58,6 +59,7 @@ class MainActivity : ComponentActivity() {
                     showOriginal        = showOriginal,
                     showMaskOverlay     = showMaskOverlay,
                     saveSuccess         = saveSuccess,
+                    blemishDebugLog     = blemishDebugLog,
                     onSelectImage       = { imagePickerLauncher.launch("image/*") },
                     onParamsChange      = viewModel::updateParams,
                     onReset             = viewModel::resetParams,
