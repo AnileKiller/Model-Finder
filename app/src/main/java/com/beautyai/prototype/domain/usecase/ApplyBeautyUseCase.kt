@@ -325,18 +325,19 @@ class ApplyBeautyUseCase {
                 val edgeProtection = smoothstep(10f, 35f, edgeStrength)
 
                 // Combine protections: If it's a shadow, highlight, OR a strong edge, don't blur it.
-                // val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
-                // val finalProtection = lightProtection * (1f - edgeProtection)
+                val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
+                val finalProtection = lightProtection * (1f - edgeProtection)
 
                 val blemishLikeness = maxOf(
                     smoothstep(3f, 12f, contrastDiff),
                     smoothstep(5f, 15f, rednessDiff)
                 )
                 
-                // Bypass all protections for debugging
-                val localAlpha = blemishLikeness * maskVal 
+                var localAlpha = blemishLikeness * finalProtection * maskVal
                 var finalAlpha = localAlpha * globalEffectIntensity
-                finalAlpha = finalAlpha.coerceIn(0f, 0.80f) 
+                
+                // 3. FIX: Tighter cap to prevent plastic look
+                finalAlpha = finalAlpha.coerceIn(0f, 0.60f) 
 
                 // --- DEBUG: Check if we are actually getting any alpha ---
                 if (maskVal > 0.5f && blemishLikeness > 0.1f) {
