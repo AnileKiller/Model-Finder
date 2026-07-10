@@ -278,97 +278,99 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    private fun applyBlemishReduction(src: Bitmap, mask: Array<FloatArray>, strength: Float, onDebugLog: ((String) -> Unit)? = null): Bitmap {
+    private fun applyBlemishReduction(
+        src: Bitmap,
+        mask: Array<FloatArray>,
+        strength: Float,
+        onDebugLog: ((String) -> Unit)? = null
+    ): Bitmap {
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)   // Max 3px
-        val wideRadius   = (w * 0.015f).toInt().coerceIn(4, 12)   // Max 12px
+        // Low-frequency (color) layer — the ONLY layer we're allowed to correct.
+        val wideRadius = (w * 0.015f).toInt().coerceIn(4, 12)
+        val lowFreq = gaussianBlur(pixels, w, h, wideRadius)
 
+        // Narrow blur used only for blemish DETECTION, same as before.
+        val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)
         val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
-        val blurWide   = gaussianBlur(pixels, w, h, wideRadius)
 
         val globalEffectIntensity = strength.coerceIn(0f, 1f)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
-                if (maskVal < 0.1f) continue 
+                if (maskVal < 0.1f) continue
 
                 val idx = y * w + x
                 val original = pixels[idx]
-                val target = blurWide[idx]  
+                val low = lowFreq[idx]
                 val narrow = blurNarrow[idx]
 
                 val oR = original shr 16 and 0xFF; val oG = original shr 8 and 0xFF; val oB = original and 0xFF
-                val tR = target shr 16 and 0xFF;   val tG = target shr 8 and 0xFF;   val tB = target and 0xFF
-                val nR = narrow shr 16 and 0xFF;   val nG = narrow shr 8 and 0xFF;   val nB = narrow and 0xFF
+                val lR = low shr 16 and 0xFF; val lG = low shr 8 and 0xFF; val lB = low and 0xFF
+                val nR = narrow shr 16 and 0xFF; val nG = narrow shr 8 and 0xFF; val nB = narrow and 0xFF
 
                 val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
-                val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
+                val lLuma = 0.299f * lR + 0.587f * lG + 0.114f * lB
                 val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
-                
-                val contrastDiff = kotlin.math.abs(nLuma - tLuma)
-                
-                val rednessOrig = (oR - oG).toFloat()
-                val rednessTarget = (tR - tG).toFloat()
-                val rednessDiff = rednessOrig - rednessTarget
 
-                // 1. FIX: Shadow likeness now correctly protects dark shadows
+                val contrastDiff = kotlin.math.abs(nLuma - lLuma)
+                val rednessOrig = (oR - oG).toFloat()
+                val rednessLow  = (lR - lG).toFloat()
+                val rednessDiff = rednessOrig - rednessLow
+
                 val shadowLikeness = 1f - smoothstep(15f, 40f, oLuma)
                 val highlightLikeness = smoothstep(180f, 255f, oLuma)
-                
-                // 2. NEW: "Edge Protection" - Stops the blur from bleeding across strong geometric lines
-                // This specifically saves the nose shadow, jawline, and cheek contours.
-                val edgeStrength = kotlin.math.abs(oLuma - tLuma)
-                val edgeProtection = smoothstep(10f, 35f, edgeStrength)
-
-                // Combine protections: If it's a shadow, highlight, OR a strong edge, don't blur it.
                 val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
-                val finalProtection = lightProtection * (1f - edgeProtection)
 
                 val blemishLikeness = maxOf(
                     smoothstep(3f, 12f, contrastDiff),
                     smoothstep(5f, 15f, rednessDiff)
                 )
-                
-                var localAlpha = blemishLikeness * finalProtection * maskVal
-                var finalAlpha = localAlpha * globalEffectIntensity
-                
-                // 3. FIX: Tighter cap to prevent plastic look
-                finalAlpha = finalAlpha.coerceIn(0f, 0.60f) 
 
-                // --- DEBUG: Check if we are actually getting any alpha ---
-                if (maskVal > 0.5f && blemishLikeness > 0.1f) {
-                    val msg = "Mask: %.2f  Blemish: %.2f  EdgeProt: %.2f  FinalAlpha: %.2f".format(
-                        maskVal, blemishLikeness, edgeProtection, finalAlpha
-                    )
-                    android.util.Log.d("BLEMISH_DEBUG", msg)
-                    onDebugLog?.invoke(msg)
-                }
-                // ---------------------------------------------------------
+                val finalAlpha = (blemishLikeness * lightProtection * maskVal * globalEffectIntensity)
+                    .coerceIn(0f, 0.85f) // safe to raise the cap now — texture can't smear
 
                 if (finalAlpha <= 0.01f) continue
 
-                // 4. FIX: "Texture Lock" blending - NOW WITH CORRECT MATH
-                // We removed the extra * 0.6f multiplier. 
-                // At 100% strength, this blends 60% to the blur and keeps 40% of the original texture.
-                val blendR = (oR * (1f - finalAlpha)) + (tR * finalAlpha)
-                val blendG = (oG * (1f - finalAlpha)) + (tG * finalAlpha)
-                val blendB = (oB * (1f - finalAlpha)) + (tB * finalAlpha)
+                if (maskVal > 0.5f && blemishLikeness > 0.1f) {
+                    val msg = "Mask: %.2f  Blemish: %.2f  FinalAlpha: %.2f".format(maskVal, blemishLikeness, finalAlpha)
+                    android.util.Log.d("BLEMISH_DEBUG", msg)
+                    onDebugLog?.invoke(msg)
+                }
+
+                // Redness desaturation on the LOW-FREQ color layer only — mirrors
+                // "reduce saturation, nudge brightness" from the HSV approach,
+                // without an HSV round-trip. Moles (not reddish) never enter this branch.
+                var corrR = lR.toFloat(); var corrG = lG.toFloat(); var corrB = lB.toFloat()
+                if (rednessOrig > 0f) {
+                    val avg = (lR + lG + lB) / 3f
+                    corrR = lR - (lR - avg) * 0.7f
+                    val lift = 6f
+                    corrR += lift; corrG += lift; corrB += lift
+                }
+
+                // Frequency-separation recombine: original + (color delta only).
+                // The original's high-frequency detail (shadow edges, freckle
+                // edges, mole edge) is never blurred — it's simply never touched.
+                val deltaR = corrR - lR
+                val deltaG = corrG - lG
+                val deltaB = corrB - lB
+
+                val finalR = (oR + deltaR * finalAlpha).toInt().coerceIn(0, 255)
+                val finalG = (oG + deltaG * finalAlpha).toInt().coerceIn(0, 255)
+                val finalB = (oB + deltaB * finalAlpha).toInt().coerceIn(0, 255)
 
                 val a = original ushr 24
-                pixels[idx] = (a shl 24) or 
-                    (blendR.toInt().coerceIn(0, 255) shl 16) or 
-                    (blendG.toInt().coerceIn(0, 255) shl 8) or 
-                    blendB.toInt().coerceIn(0, 255)
+                pixels[idx] = (a shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
             }
         }
 
         src.setPixels(pixels, 0, w, 0, 0, w, h)
         return src
-    }
+    }    
 
 
     private fun applyUnderEyeReduction(
