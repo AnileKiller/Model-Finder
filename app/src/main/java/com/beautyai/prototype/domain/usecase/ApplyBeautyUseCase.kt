@@ -341,15 +341,19 @@ class ApplyBeautyUseCase {
                     onDebugLog?.invoke(msg)
                 }
 
-                // Redness desaturation on the LOW-FREQ color layer only — mirrors
-                // "reduce saturation, nudge brightness" from the HSV approach,
-                // without an HSV round-trip. Moles (not reddish) never enter this branch.
+                // Redness desaturation on the LOW-FREQ color layer only.
                 var corrR = lR.toFloat(); var corrG = lG.toFloat(); var corrB = lB.toFloat()
+                
                 if (rednessOrig > 0f) {
-                    val avg = (lR + lG + lB) / 3f
-                    corrR = lR - (lR - avg) * 0.7f
-                    val lift = 6f
-                    corrR += lift; corrG += lift; corrB += lift
+                    // If it's a red blemish, set the Red channel to match the Blue channel
+                    // of the blurred background. This kills the redness without shifting to gray.
+                    corrR = (lR + lB) / 2f
+                    
+                    // Give it a tiny boost so it doesn't look dull
+                    val subtleLift = 3f
+                    corrR += subtleLift
+                    corrG += subtleLift
+                    corrB += subtleLift
                 }
 
                 // Frequency-separation recombine: original + (color delta only).
