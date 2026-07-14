@@ -288,11 +288,11 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // Low-frequency (color) layer — the ONLY layer we're allowed to correct.
+        // Low-frequency (color) layer
         val wideRadius = (w * 0.015f).toInt().coerceIn(4, 12)
         val lowFreq = gaussianBlur(pixels, w, h, wideRadius)
 
-        // Narrow blur used only for blemish DETECTION, same as before.
+        // Narrow blur for detection
         val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)
         val blurNarrow = gaussianBlur(pixels, w, h, narrowRadius)
 
@@ -321,17 +321,16 @@ class ApplyBeautyUseCase {
                 val rednessLow  = (lR - lG).toFloat()
                 val rednessDiff = rednessOrig - rednessLow
 
-                val shadowLikeness = 1f - smoothstep(15f, 40f, oLuma)
-                val highlightLikeness = smoothstep(180f, 255f, oLuma)
-                val lightProtection = 1f - maxOf(shadowLikeness, highlightLikeness)
+                // BUG FIX #2: Simplified protection. No hard cutoffs.
+                val protection = 1f - smoothstep(0f, 30f, kotlin.math.abs(oLuma - lLuma))
 
                 val blemishLikeness = maxOf(
-                    smoothstep(3f, 12f, contrastDiff),
-                    smoothstep(5f, 15f, rednessDiff)
+                    smoothstep(1f, 8f, contrastDiff), // Lowered thresholds for sensitivity
+                    smoothstep(1f, 8f, rednessDiff)
                 )
 
-                val finalAlpha = (blemishLikeness * lightProtection * maskVal * globalEffectIntensity)
-                    .coerceIn(0f, 0.85f) // safe to raise the cap now — texture can't smear
+                var finalAlpha = (blemishLikeness * protection * maskVal * globalEffectIntensity)
+                    .coerceIn(0f, 0.75f) // Lowered max blend to keep more original texture
 
                 if (finalAlpha <= 0.01f) continue
 
@@ -341,24 +340,24 @@ class ApplyBeautyUseCase {
                     onDebugLog?.invoke(msg)
                 }
 
-                // Redness desaturation on the LOW-FREQ color layer only.
+                // --- BUG FIXES #1 and #3: The Desaturation Logic ---
                 var corrR = lR.toFloat(); var corrG = lG.toFloat(); var corrB = lB.toFloat()
 
-                if (rednessDiff > 5f) { // Only trigger on highly red pimples!
-                    // FIX: Instead of pulling towards gray/Blue, substitute Red with Green.
-                    // This completely kills the red hue while keeping the skin tone perfectly natural.
-                    corrR = lG.toFloat()
+                // If there's ANY redness, we correct it (removed the >5f restriction).
+                if (rednessDiff > 1f) { 
+                    // Instead of flat lG, we do a weighted average. 
+                    // This preserves the skin's natural warmth, preventing the "gray splotch".
+                    corrR = (lR * 0.3f) + (lG * 0.7f)
                     
-                    // Give it a tiny brightness lift so it blends better
-                    val subtleLift = 2f
-                    corrR += subtleLift
-                    corrG += subtleLift
-                    corrB += subtleLift
+                    // Do NOT add flat 'subtleLift'. Instead, we just raise the min brightness
+                    // so dark pimples don't turn into dark holes.
+                    val minBrightness = 30f
+                    if (corrR < minBrightness) corrR = minBrightness
+                    if (corrG < minBrightness) corrG = minBrightness
+                    if (corrB < minBrightness) corrB = minBrightness
                 }
 
-                // Frequency-separation recombine: original + (color delta only).
-                // The original's high-frequency detail (shadow edges, freckle
-                // edges, mole edge) is never blurred — it's simply never touched.
+                // Frequency-separation recombine
                 val deltaR = corrR - lR
                 val deltaG = corrG - lG
                 val deltaB = corrB - lB
@@ -374,7 +373,7 @@ class ApplyBeautyUseCase {
 
         src.setPixels(pixels, 0, w, 0, 0, w, h)
         return src
-    }    
+    }
 
 
     private fun applyUnderEyeReduction(
