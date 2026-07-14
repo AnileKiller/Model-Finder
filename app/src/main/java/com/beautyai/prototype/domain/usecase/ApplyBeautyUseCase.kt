@@ -343,14 +343,14 @@ class ApplyBeautyUseCase {
 
                 // Redness desaturation on the LOW-FREQ color layer only.
                 var corrR = lR.toFloat(); var corrG = lG.toFloat(); var corrB = lB.toFloat()
-                
-                if (rednessOrig > 0f) {
-                    // If it's a red blemish, set the Red channel to match the Blue channel
-                    // of the blurred background. This kills the redness without shifting to gray.
-                    corrR = (lR + lB) / 2f
+
+                if (rednessDiff > 5f) { // Only trigger on highly red pimples!
+                    // FIX: Instead of pulling towards gray/Blue, substitute Red with Green.
+                    // This completely kills the red hue while keeping the skin tone perfectly natural.
+                    corrR = lG.toFloat()
                     
-                    // Give it a tiny boost so it doesn't look dull
-                    val subtleLift = 3f
+                    // Give it a tiny brightness lift so it blends better
+                    val subtleLift = 2f
                     corrR += subtleLift
                     corrG += subtleLift
                     corrB += subtleLift
