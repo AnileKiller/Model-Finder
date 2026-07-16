@@ -279,31 +279,28 @@ class ApplyBeautyUseCase {
     }
 
     /**
-     * BLEMISH REDUCTION v2 — three-band frequency separation with semantic gating.
+     * BLEMISH REDUCTION v3 — visible results, same four safety rules.
      *
-     * Band layout (per pixel, per channel):
-     *   fine  = original - narrow   → pores, fine hairs, micro-texture  (NEVER touched)
-     *   band  = narrow  - low       → blemish-scale content (2–5 mm)    (what we remove)
-     *   base  = low                 → clean-skin color baseline          (NEVER touched)
+     * What changed vs v2 (and why v2 looked invisible):
+     *  1. SIZE GATE FIXED: v2 suppressed any redness that "survived" the mid
+     *     blur — but real pimples are about the same size as the mid radius,
+     *     so they survived and got suppressed. v3 only suppresses redness
+     *     that is nearly FULLY persistent (large structures: lips, flush,
+     *     nose shading), and the mid radius is doubled so a pimple is
+     *     genuinely diluted by it.
+     *  2. CORRECTION STRENGTH FIXED: v2 removed only the (narrow − low) band,
+     *     which is tiny when the whole area is red (the baseline itself is
+     *     contaminated by neighboring pimples). v3 removes the pixel's OWN
+     *     redness excess (R−G, B−G vs baseline) directly — full-strength
+     *     color correction — plus a gentle luma lift for the dark center.
      *
-     * Correction is simply:  final = original - band * alpha
-     * At alpha = 1 the blemish-scale bump (color + shading) is gone, but the
-     * fine texture layer and the structural baseline are bit-identical to the
-     * source. No cloning, no inpainting, no new pixels invented.
-     *
-     * Gates (all multiplicative on alpha):
-     *   likeness        — redness of the band vs. baseline. Only red/inflamed
-     *                     spots qualify. A black marker line, a shadow, or a
-     *                     mole has no redness band → alpha = 0 → untouched.
-     *   moleProtection  — anything significantly DARKER than its surroundings
-     *                     (moles, beauty marks, freckles, stray hairs, lashes)
-     *                     is explicitly protected, independent of redness.
-     *   specProtection  — specular highlights (glints) are protected so we
-     *                     don't dull healthy skin sheen.
-     *   sizeProtection  — redness that SURVIVES the mid-radius blur is larger
-     *                     than a pimple (flushed cheeks, lips, nose-side
-     *                     redness, structural shading) → suppressed. This is
-     *                     the "smaller than natural facial features" rule.
+     * Rules still enforced:
+     *  RULE 1: size persistence gate + redness gate → structure untouched.
+     *  RULE 2: only chroma (R−G, B−G) is corrected; G carries the texture and
+     *          is only shifted by the smooth luma lift → pores stay crisp.
+     *  RULE 3: redness gate + darkness gate → moles/freckles/hairs untouched.
+     *  RULE 4: alpha map is per-pixel and feathered by 1px only → pimple
+     *          edges stay sharp, footprint never grows.
      */
     private fun applyBlemishReduction(
         src: Bitmap,
@@ -315,26 +312,20 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // ── Three frequency bands ────────────────────────────────────────────
-        // narrow: below this radius lives pore/hair texture we must not touch.
+        // ── Frequency bands ─────────────────────────────────────────────────
         val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)
-        // mid: roughly one pimple radius (2–5 mm). Used ONLY for size gating.
-        val midRadius = (w * 0.010f).toInt().coerceIn(6, 20)
-        // wide: clean-skin baseline. Big enough that a single pimple barely
-        // contaminates its own baseline.
-        val wideRadius = (w * 0.025f).toInt().coerceIn(14, 40)
+        val midRadius = (w * 0.020f).toInt().coerceIn(10, 32)
+        val wideRadius = (w * 0.045f).toInt().coerceIn(20, 64)
 
         val narrow = gaussianBlur(pixels, w, h, narrowRadius)
         val mid    = gaussianBlur(pixels, w, h, midRadius)
         val low    = gaussianBlur(pixels, w, h, wideRadius)
 
-        val globalIntensity = strength.coerceIn(0f, 1f)
+        val globalIntensity = sqrt(strength.coerceIn(0f, 1f))
+        // SAFETY CAP REDUCED: 0.70 ensures skin tone is never fully bleached
+        val maxAlpha = 0.70f 
 
-        // Even at 100% slider we never fully erase — keeps a ghost of reality
-        // so the result reads as "clear skin", not "airbrushed".
-        val maxAlpha = 0.85f
-
-        // ── PASS 1: build the per-pixel blemish alpha map ────────────────────
+        // ── PASS 1: per-pixel blemish alpha map ─────────────────────────────
         val alphaMap = Array(h) { FloatArray(w) }
         var hits = 0; var alphaSum = 0f
 
@@ -350,34 +341,22 @@ class ApplyBeautyUseCase {
                 val mR = m shr 16 and 0xFF; val mG = m shr 8 and 0xFF
                 val lR = l shr 16 and 0xFF; val lG = l shr 8 and 0xFF; val lB = l and 0xFF
 
-                // Redness of the blemish band relative to local baseline.
-                // Detected on the narrow blur (noise-robust) so a single hot
-                // pixel doesn't trigger, but a real pimple does.
                 val rednessBand = (nR - nG) - (lR - lG).toFloat()
-
-                // RULE 3 + RULE 2 GATE: only red/inflamed color qualifies.
-                val likeness = smoothstep(4f, 12f, rednessBand)
+                val likeness = smoothstep(2.5f, 9f, rednessBand)
                 if (likeness <= 0f) continue
 
                 val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
                 val lLuma = 0.299f * lR + 0.587f * lG + 0.114f * lB
 
-                // RULE 3 (Mole Rule): pixels much darker than their baseline are
-                // moles, beauty marks, freckles, hairs, or hard shadows/lines.
-                // Protection hits 0 well before mole-level darkness.
                 val darkness = lLuma - nLuma
                 val moleProtection = 1f - smoothstep(18f, 40f, darkness)
                 if (moleProtection <= 0f) continue
 
-                // Protect specular highlights (healthy sheen, glints).
                 val specProtection = 1f - smoothstep(30f, 60f, nLuma - lLuma)
 
-                // RULE 1 (Size gate): if the redness still exists after the
-                // mid-radius blur, the red region is BIGGER than a pimple —
-                // it's structure (flush, lips-adjacent skin, nose shading).
                 val rednessMid = (mR - mG) - (lR - lG).toFloat()
                 val persistence = rednessMid / rednessBand.coerceAtLeast(1f)
-                val sizeProtection = 1f - smoothstep(0.55f, 0.85f, persistence)
+                val sizeProtection = 1f - smoothstep(0.75f, 1.0f, persistence)
 
                 val a = (likeness * moleProtection * specProtection *
                         sizeProtection * maskVal * globalIntensity)
@@ -390,19 +369,16 @@ class ApplyBeautyUseCase {
             }
         }
 
-        // RULE 4: feather the alpha map by 1px only — kills single-pixel
-        // speckle without growing the spot's footprint. (A big feather here is
-        // exactly what causes "the pimple expanded" failures — keep it at 1.)
         val alpha = preBlurMask(alphaMap, w, h, 1)
 
         if (hits > 0) {
-            val msg = "Blemish v2: %d px corrected, mean alpha %.2f (n=%d m=%d w=%d)"
+            val msg = "Blemish v3: %d px corrected, mean alpha %.2f (n=%d m=%d w=%d)"
                 .format(hits, alphaSum / hits, narrowRadius, midRadius, wideRadius)
             android.util.Log.d("BLEMISH_DEBUG", msg)
             onDebugLog?.invoke(msg)
         }
 
-        // ── PASS 2: subtract the blemish band, keep everything else ─────────
+        // ── PASS 2: full-strength color correction, texture preserved ──────
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val a = alpha[y][x]
@@ -415,18 +391,16 @@ class ApplyBeautyUseCase {
                 val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
                 val lR = l shr 16 and 0xFF; val lG = l shr 8 and 0xFF; val lB = l and 0xFF
 
-                // final = original - (blemish band) * alpha
-                // fine texture (original - narrow) passes through untouched:
-                // pores stay crisp at any slider strength.
-                // FIX: Calculate the proportional "over-shoot" compared to the baseline.
-                // This ensures dark pimples turn into the dark background, not pale gray holes.
-                val overshootR = if (nR > lR) (nR - lR) else 0
-                val overshootG = if (nG > lG) (nG - lG) else 0
-                val overshootB = if (nB > lB) (nB - lB) else 0
+                val excessR = ((oR - oG) - (lR - lG)).toFloat().coerceIn(0f, 60f)
+                val excessB = ((oB - oG) - (lB - lG)).toFloat().coerceIn(0f, 40f)
 
-                val fR = (oR - overshootR * a).toInt().coerceIn(0, 255)
-                val fG = (oG - overshootG * a).toInt().coerceIn(0, 255)
-                val fB = (oB - overshootB * a).toInt().coerceIn(0, 255)
+                val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
+                val lLuma = 0.299f * lR + 0.587f * lG + 0.114f * lB
+                val lift = (lLuma - nLuma).coerceIn(0f, 25f) * 0.7f * a
+
+                val fR = (oR - excessR * a + lift).toInt().coerceIn(0, 255)
+                val fG = (oG + lift).toInt().coerceIn(0, 255)
+                val fB = (oB - excessB * a + lift).toInt().coerceIn(0, 255)
 
                 val alphaCh = o ushr 24
                 pixels[idx] = (alphaCh shl 24) or (fR shl 16) or (fG shl 8) or fB
