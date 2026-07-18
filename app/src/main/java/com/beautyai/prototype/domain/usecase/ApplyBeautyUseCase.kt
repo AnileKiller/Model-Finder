@@ -278,30 +278,6 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /**
-     * BLEMISH REDUCTION v3 — visible results, same four safety rules.
-     *
-     * What changed vs v2 (and why v2 looked invisible):
-     *  1. SIZE GATE FIXED: v2 suppressed any redness that "survived" the mid
-     *     blur — but real pimples are about the same size as the mid radius,
-     *     so they survived and got suppressed. v3 only suppresses redness
-     *     that is nearly FULLY persistent (large structures: lips, flush,
-     *     nose shading), and the mid radius is doubled so a pimple is
-     *     genuinely diluted by it.
-     *  2. CORRECTION STRENGTH FIXED: v2 removed only the (narrow − low) band,
-     *     which is tiny when the whole area is red (the baseline itself is
-     *     contaminated by neighboring pimples). v3 removes the pixel's OWN
-     *     redness excess (R−G, B−G vs baseline) directly — full-strength
-     *     color correction — plus a gentle luma lift for the dark center.
-     *
-     * Rules still enforced:
-     *  RULE 1: size persistence gate + redness gate → structure untouched.
-     *  RULE 2: only chroma (R−G, B−G) is corrected; G carries the texture and
-     *          is only shifted by the smooth luma lift → pores stay crisp.
-     *  RULE 3: redness gate + darkness gate → moles/freckles/hairs untouched.
-     *  RULE 4: alpha map is per-pixel and feathered by 1px only → pimple
-     *          edges stay sharp, footprint never grows.
-     */
     private fun applyBlemishReduction(
         src: Bitmap,
         mask: Array<FloatArray>,
@@ -312,22 +288,18 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // ── Frequency bands ─────────────────────────────────────────────────
-        val narrowRadius = (w * 0.0015f).toInt().coerceIn(1, 3)
-        val midRadius = (w * 0.020f).toInt().coerceIn(10, 32)
-        val wideRadius = (w * 0.045f).toInt().coerceIn(20, 64)
+        // 1. Radii for Frequency Separation
+        val narrowRadius = (w * 0.002f).toInt().coerceIn(1, 4)
+        val wideRadius = (w * 0.025f).toInt().coerceIn(8, 24)
 
         val narrow = gaussianBlur(pixels, w, h, narrowRadius)
-        val mid    = gaussianBlur(pixels, w, h, midRadius)
-        val low    = gaussianBlur(pixels, w, h, wideRadius)
+        val wide = gaussianBlur(pixels, w, h, wideRadius)
 
-        val globalIntensity = sqrt(strength.coerceIn(0f, 1f))
-        // SAFETY CAP REDUCED: 0.70 ensures skin tone is never fully bleached
-        val maxAlpha = 0.70f 
+        var hits = 0
+        var alphaSum = 0f
 
-        // ── PASS 1: per-pixel blemish alpha map ─────────────────────────────
-        val alphaMap = Array(h) { FloatArray(w) }
-        var hits = 0; var alphaSum = 0f
+        val globalIntensity = strength.coerceIn(0f, 1f)
+        val maxAlpha = 0.90f // Higher cap to ensure the correction is highly visible
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -335,88 +307,57 @@ class ApplyBeautyUseCase {
                 if (maskVal < 0.1f) continue
 
                 val idx = y * w + x
-                val n = narrow[idx]; val m = mid[idx]; val l = low[idx]
+                val o = pixels[idx]
+                val n = narrow[idx]
+                val t = wide[idx] // Target (low frequency healthy skin)
 
                 val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
-                val mR = m shr 16 and 0xFF; val mG = m shr 8 and 0xFF
-                val lR = l shr 16 and 0xFF; val lG = l shr 8 and 0xFF; val lB = l and 0xFF
+                val tR = t shr 16 and 0xFF; val tG = t shr 8 and 0xFF; val tB = t and 0xFF
 
-                val rednessBand = (nR - nG) - (lR - lG).toFloat()
-                val likeness = smoothstep(2.5f, 9f, rednessBand)
-                if (likeness <= 0f) continue
+                // A. Redness Detection (Acne/Inflammation)
+                val nRedness = nR - nG
+                val tRedness = tR - tG
+                val rednessSpike = (nRedness - tRedness).toFloat()
+                val rednessAlpha = smoothstep(4f, 18f, rednessSpike)
 
+                // B. Luma Detection (Dark spots / pores)
                 val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
-                val lLuma = 0.299f * lR + 0.587f * lG + 0.114f * lB
+                val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
+                val lumaDip = tLuma - nLuma
+                val lumaAlpha = smoothstep(8f, 25f, lumaDip)
 
-                val darkness = lLuma - nLuma
-                val moleProtection = 1f - smoothstep(18f, 40f, darkness)
-                if (moleProtection <= 0f) continue
+                // C. Mole / Deep Shadow Protection (Ignore extremely dark spots compared to surrounding)
+                val shadowProtection = 1f - smoothstep(35f, 60f, lumaDip)
 
-                val specProtection = 1f - smoothstep(30f, 60f, nLuma - lLuma)
+                // Combine detection
+                var a = maxOf(rednessAlpha, lumaAlpha) * shadowProtection * maskVal * globalIntensity
+                a = a.coerceIn(0f, maxAlpha)
 
-                val rednessMid = (mR - mG) - (lR - lG).toFloat()
-                val persistence = rednessMid / rednessBand.coerceAtLeast(1f)
-                val sizeProtection = 1f - smoothstep(0.90f, 1.0f, persistence)
-
-                val a = (likeness * moleProtection * specProtection *
-                        sizeProtection * maskVal * globalIntensity)
-                    .coerceIn(0f, maxAlpha)
-
-                // Store even small values so the blur has a dense map to work
-                // with — isolated qualifying pixels won't get averaged to zero.
-                alphaMap[y][x] = a
-                if (a > 0.02f) {
-                    hits++; alphaSum += a
-                }
-            }
-        }
-
-        // RULE 4: blur the DENSE map first, then apply the cutoff — this way
-        // the blur fills in gaps between qualifying pixels before zeroing out
-        // the truly empty regions (prevents sparse islands from vanishing).
-        val alpha = preBlurMask(alphaMap, w, h, 1)
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                if (alpha[y][x] < 0.02f) alpha[y][x] = 0f
-            }
-        }
-
-        if (hits > 0) {
-            val msg = "Blemish v3: %d px corrected, mean alpha %.2f (n=%d m=%d w=%d)"
-                .format(hits, alphaSum / hits, narrowRadius, midRadius, wideRadius)
-            android.util.Log.d("BLEMISH_DEBUG", msg)
-            onDebugLog?.invoke(msg)
-        }
-
-        // ── PASS 2: full-strength color correction, texture preserved ──────
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val a = alpha[y][x]
                 if (a <= 0.02f) continue
 
-                val idx = y * w + x
-                val o = pixels[idx]; val n = narrow[idx]; val l = low[idx]
+                hits++
+                alphaSum += a
 
+                // 2. Frequency Separation Blend (The Magic Formula)
+                // Formula: Original + (Target - Narrow) * Alpha
                 val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
-                val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
-                val lR = l shr 16 and 0xFF; val lG = l shr 8 and 0xFF; val lB = l and 0xFF
 
-                val excessR = ((oR - oG) - (lR - lG)).toFloat().coerceIn(0f, 60f)
-                val excessB = ((oB - oG) - (lB - lG)).toFloat().coerceIn(0f, 40f)
-
-                val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
-                val lLuma = 0.299f * lR + 0.587f * lG + 0.114f * lB
-                val lift = (lLuma - nLuma).coerceIn(0f, 25f) * 0.7f * a
-
-                val fR = (oR - excessR * a + lift).toInt().coerceIn(0, 255)
-                val fG = (oG + lift).toInt().coerceIn(0, 255)
-                val fB = (oB - excessB * a + lift).toInt().coerceIn(0, 255)
+                val fR = (oR + (tR - nR) * a).toInt().coerceIn(0, 255)
+                val fG = (oG + (tG - nG) * a).toInt().coerceIn(0, 255)
+                val fB = (oB + (tB - nB) * a).toInt().coerceIn(0, 255)
 
                 val alphaCh = o ushr 24
                 pixels[idx] = (alphaCh shl 24) or (fR shl 16) or (fG shl 8) or fB
             }
         }
 
+        if (hits > 0) {
+            val msg = "Blemish FS: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
+            android.util.Log.d("BLEMISH_DEBUG", msg)
+            onDebugLog?.invoke(msg)
+        }
+
+        // Memory fix: Reuse the existing mutable bitmap instead of allocating a copy
         src.setPixels(pixels, 0, w, 0, 0, w, h)
         return src
     }
