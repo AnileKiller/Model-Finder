@@ -362,14 +362,24 @@ class ApplyBeautyUseCase {
                         sizeProtection * maskVal * globalIntensity)
                     .coerceIn(0f, maxAlpha)
 
+                // Store even small values so the blur has a dense map to work
+                // with — isolated qualifying pixels won't get averaged to zero.
+                alphaMap[y][x] = a
                 if (a > 0.02f) {
-                    alphaMap[y][x] = a
                     hits++; alphaSum += a
                 }
             }
         }
 
+        // RULE 4: blur the DENSE map first, then apply the cutoff — this way
+        // the blur fills in gaps between qualifying pixels before zeroing out
+        // the truly empty regions (prevents sparse islands from vanishing).
         val alpha = preBlurMask(alphaMap, w, h, 1)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                if (alpha[y][x] < 0.02f) alpha[y][x] = 0f
+            }
+        }
 
         if (hits > 0) {
             val msg = "Blemish v3: %d px corrected, mean alpha %.2f (n=%d m=%d w=%d)"
