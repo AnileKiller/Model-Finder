@@ -288,19 +288,20 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. Radii for Frequency Separation
+        // 1. Restore 3-Tier Blurs for the Size Gate (Protects Lips)
         val narrowRadius = (w * 0.002f).toInt().coerceIn(1, 4)
-        // Increased wide radius slightly to pull cleaner skin from outside large acne clusters
-        val wideRadius = (w * 0.035f).toInt().coerceIn(12, 32) 
+        val midRadius = (w * 0.020f).toInt().coerceIn(10, 32)
+        val wideRadius = (w * 0.045f).toInt().coerceIn(20, 64)
 
         val narrow = gaussianBlur(pixels, w, h, narrowRadius)
+        val mid = gaussianBlur(pixels, w, h, midRadius)
         val wide = gaussianBlur(pixels, w, h, wideRadius)
 
         var hits = 0
         var alphaSum = 0f
 
         val globalIntensity = strength.coerceIn(0f, 1f)
-        val maxAlpha = 0.95f // High cap for maximum coverage
+        val maxAlpha = 0.90f 
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -310,28 +311,36 @@ class ApplyBeautyUseCase {
                 val idx = y * w + x
                 val o = pixels[idx]
                 val n = narrow[idx]
+                val m = mid[idx]
                 val t = wide[idx]
 
                 val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
                 val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
+                val mR = m shr 16 and 0xFF; val mG = m shr 8 and 0xFF
                 val tR = t shr 16 and 0xFF; val tG = t shr 8 and 0xFF; val tB = t and 0xFF
 
-                // A. Redness Detection
+                // A. Redness Detection & Size Gate 
                 val nRedness = nR - nG
+                val mRedness = mR - mG
                 val tRedness = tR - tG
-                val rednessSpike = (nRedness - tRedness).toFloat()
-                val rednessAlpha = smoothstep(2f, 15f, rednessSpike)
+                
+                val excessRed = (nRedness - tRedness).toFloat()
+                val rednessAlpha = smoothstep(2f, 12f, excessRed)
+                
+                // If redness persists heavily in the mid blur, it's structural (like lips). Ignore it.
+                val midExcess = (mRedness - tRedness).toFloat()
+                val persistence = midExcess / excessRed.coerceAtLeast(1f)
+                val sizeProtection = 1f - smoothstep(0.70f, 0.95f, persistence)
 
-                // B. Luma Detection
+                // B. Luma Detection & Mole Protection
                 val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
                 val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
-                val lumaDip = tLuma - nLuma
-                val lumaAlpha = smoothstep(5f, 20f, lumaDip)
+                val lumaDrop = tLuma - nLuma
+                val lumaAlpha = smoothstep(4f, 15f, lumaDrop)
 
-                // C. Shadow/Mole Protection
-                val shadowProtection = 1f - smoothstep(30f, 50f, lumaDip)
+                val shadowProtection = 1f - smoothstep(25f, 50f, lumaDrop)
 
-                var a = maxOf(rednessAlpha, lumaAlpha) * shadowProtection * maskVal * globalIntensity
+                var a = maxOf(rednessAlpha, lumaAlpha) * shadowProtection * sizeProtection * maskVal * globalIntensity
                 a = a.coerceIn(0f, maxAlpha)
 
                 if (a <= 0.02f) continue
@@ -339,35 +348,36 @@ class ApplyBeautyUseCase {
                 hits++
                 alphaSum += a
 
-                // 2. Luminance-Only Frequency Separation (The Anti-Grey Fix)
-                // Extract ONLY the grayscale texture (pores/bumps) from the high frequencies.
-                val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
-                val textureDetail = oLuma - nLuma
+                // 2. ADDITIVE HEALING (The Anti-Zombie Fix)
+                // Instead of subtracting Red (which causes grey bruising), we neutralize 
+                // the redness by ADDING Green and Blue to match the healthy surround ratio.
+                val gBoost = excessRed.coerceAtLeast(0f) * a
+                val bBoost = (excessRed * 0.85f).coerceAtLeast(0f) * a // Slightly less blue for warmth
 
-                // Add the pure grayscale texture onto the clean target color
-                val idealR = tR + textureDetail
-                val idealG = tG + textureDetail
-                val idealB = tB + textureDetail
+                var fR = oR.toFloat()
+                var fG = oG + gBoost
+                var fB = oB + bBoost
 
-                var fR = (oR + (idealR - oR) * a).toInt()
-                var fG = (oG + (idealG - oG) * a).toInt()
-                var fB = (oB + (idealB - oB) * a).toInt()
+                // 3. Luma Lift
+                // Lift all channels evenly until the spot perfectly matches the brightness of the healthy skin.
+                val currentLuma = 0.299f * fR + 0.587f * fG + 0.114f * fB
+                val lumaDeficit = (tLuma - currentLuma).coerceAtLeast(0f)
+                val lift = lumaDeficit * a
 
-                // 3. The Ashy Protector
-                // Human skin MUST be warm. If the red channel drops too low, 
-                // gently lift it to prevent grey/green dead spots.
-                if (fR < fG + 8) fR = fG + 8
+                fR += lift
+                fG += lift
+                fB += lift
 
                 val alphaCh = o ushr 24
                 pixels[idx] = (alphaCh shl 24) or 
-                              (fR.coerceIn(0, 255) shl 16) or 
-                              (fG.coerceIn(0, 255) shl 8) or 
-                              fB.coerceIn(0, 255)
+                              (fR.toInt().coerceIn(0, 255) shl 16) or 
+                              (fG.toInt().coerceIn(0, 255) shl 8) or 
+                              fB.toInt().coerceIn(0, 255)
             }
         }
 
         if (hits > 0) {
-            val msg = "Blemish Luma-FS: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
+            val msg = "Blemish Additive: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
             android.util.Log.d("BLEMISH_DEBUG", msg)
             onDebugLog?.invoke(msg)
         }
