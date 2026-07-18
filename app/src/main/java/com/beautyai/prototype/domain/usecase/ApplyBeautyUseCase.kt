@@ -30,26 +30,8 @@ class ApplyBeautyUseCase {
         // multiplying the segmentation mask by this kills any body-skin false
         // positive that isn't near the face outline (e.g. a hand in frame),
         // since the segmentation model has no notion of "this is a hand."
-        //
-        // FEATURE_FACE_OVAL's apex is landmark 10 — MediaPipe's single fixed
-        // forehead-top point, which sits below the actual hairline on many
-        // faces/head angles. Anything above it (e.g. a forehead pimple near
-        // the hairline) was getting multiplied by zero here regardless of how
-        // strong the blemish passes were. Dilate the polygon outward before
-        // drawing so it reaches further into the forehead; this is safe
-        // because `refinedMask` (real segmentation, multiplied in below) still
-        // excludes hair/background, so this only recovers forehead skin that
-        // the geometric oval had wrongly cut off.
-        var ovalMinX = source.width.toFloat(); var ovalMaxX = 0f
-        for (idx in FEATURE_FACE_OVAL) {
-            val lm = faceData.landmarks[idx]
-            ovalMinX = minOf(ovalMinX, lm.x * source.width)
-            ovalMaxX = maxOf(ovalMaxX, lm.x * source.width)
-        }
-        val ovalFaceWidth = (ovalMaxX - ovalMinX).coerceAtLeast(1f)
         val faceOvalMask = createFeatureMask(
-            faceData, listOf(FEATURE_FACE_OVAL), source.width, source.height, 35f,
-            expansion = ovalFaceWidth * 0.10f
+            faceData, listOf(FEATURE_FACE_OVAL), source.width, source.height, 35f
         )
 
         // 3a. Smooth mask — segmentation-based (includes neck/body-skin at the
@@ -71,8 +53,9 @@ class ApplyBeautyUseCase {
             source.width, source.height
         )
 
-        // 3b. Sharp mask — used by face sharpening only. Blemish reduction uses
-        // the protected facial-skin mask below, not this face-oval-only mask.
+        // 3b. Sharp mask — face oval only (no exclusion zones, just a soft geometric mask)
+        // We do NOT punch exclusion zones because the blemish reduction logic itself 
+        // uses redness/contrast detection to avoid eyes and lips naturally.
         val sharpMask = preBlurMask(faceOvalMask, source.width, source.height, 12)
 
         // Sharpening first — works on original, unmodified detail
@@ -82,22 +65,8 @@ class ApplyBeautyUseCase {
         if (effective.skinSmoothing > 0f)
             result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
 
-        // Blemishes must be detected only on facial skin.  A face-oval mask alone
-        // includes eyes, brows, lips, hair and background at the oval edge.
-        val blemishMask = multiplyMasks(refinedMask, faceOvalMask)
-        if (effective.blemishReduction > 0f) {
-            // Pass 1: decisive repair of discrete, compact spots (pimples, small
-            // marks). Component-area-gated, so broad/connected redness is
-            // deliberately left untouched here and picked up by pass 2 instead.
-            result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
-
-            // Pass 2: gentle amplitude reduction of diffuse redness/erythema
-            // (acne flush, broad blotchy patches) that pass 1's compact-component
-            // gate intentionally rejects. Scales the red channel down toward the
-            // region's own local baseline rather than replacing pixels outright,
-            // so texture and any faint natural blush survive.
-            result = applyDiffuseRednessReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
-        }
+        if (effective.blemishReduction > 0f)
+            result = applyBlemishReduction(result, sharpMask, effective.blemishReduction, onDebugLog)
 
         if (effective.skinBrightness > 0f)
             result = applySkinBrightness(result, smoothMask, effective.skinBrightness)
@@ -309,276 +278,79 @@ class ApplyBeautyUseCase {
         return result
     }
 
-    /**
-     * BLEMISH REDUCTION v5
-     *
-     * Detects compact, locally red / dark spots on the protected facial-skin
-     * mask, then replaces their colour and shading with a local skin estimate.
-     * This is deliberately not a global red-desaturation pass: diffuse redness
-     * and large facial structures are rejected as connected components.
-     */
     private fun applyBlemishReduction(
         src: Bitmap,
         mask: Array<FloatArray>,
         strength: Float,
         onDebugLog: ((String) -> Unit)? = null
     ): Bitmap {
-        val w = src.width
-        val h = src.height
+        val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // Scale all spatial thresholds from the actual active facial-skin area,
-        // not from the full camera frame (which may contain a hand/background).
-        var minX = w; var maxX = -1; var minY = h; var maxY = -1
-        for (y in 0 until h) for (x in 0 until w) {
-            if (mask[y][x] >= 0.5f) {
-                minX = minOf(minX, x); maxX = maxOf(maxX, x)
-                minY = minOf(minY, y); maxY = maxOf(maxY, y)
-            }
-        }
-        if (maxX < minX || maxY < minY) return src
-        val faceWidth = (maxX - minX + 1).coerceAtLeast(1)
-        // r=5 (seen in the debug output) samples mostly *inside* a typical
-        // 12–30 px pimple, making the supposed skin target almost identical to
-        // the defect. Use a surrounding-skin scale instead.
-        val localRadius = (faceWidth * 0.040f).toInt().coerceIn(12, 30)
-        val narrowRadius = 1
+        // 1. Single Heavy Blur (The "Commercial Instagram" Base)
+        // A wider radius creates that smooth, wax-like smudge over blemishes
+        val blurRadius = (w * 0.035f).toInt().coerceIn(12, 48)
+        val blurred = gaussianBlur(pixels, w, h, blurRadius)
 
-        // `gaussianBlur` is a separable box blur in this class.  Here it is a
-        // local skin baseline; it is never used as a full-face colour baseline.
-        val narrow = gaussianBlur(pixels, w, h, narrowRadius)
-        val baseline = gaussianBlur(pixels, w, h, localRadius)
-        val response = FloatArray(w * h)
-        val candidate = BooleanArray(w * h)
+        var hits = 0
+        var alphaSum = 0f
+        val globalIntensity = strength.coerceIn(0f, 1f)
 
-        for (y in 0 until h) for (x in 0 until w) {
-            val idx = y * w + x
-            if (mask[y][x] < 0.5f) continue
-            val n = narrow[idx]; val b = baseline[idx]
-            val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
-            val bR = b shr 16 and 0xFF; val bG = b shr 8 and 0xFF; val bB = b and 0xFF
+        // 2. Luminance-Gated Blend (O(N) Edge-Preserving Filter)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val maskVal = mask[y][x]
+                if (maskVal <= 0.02f) continue
 
-            // Redness and darkness are measured relative to nearby skin, so a
-            // normal cheek gradient or globally warm lighting does not qualify.
-            val localRed = ((nR - nG) - (bR - bG)).toFloat()
-            val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
-            val bLuma = 0.299f * bR + 0.587f * bG + 0.114f * bB
-            val localDark = bLuma - nLuma
-            val redScore = smoothstep(3.5f, 11f, localRed)
-            // A dark centre is eligible only when it also has some local red
-            // excess. This protects neutral moles, freckles and eyelashes.
-            val darkScore = smoothstep(5f, 18f, localDark) * smoothstep(1.5f, 8f, localRed)
-            val score = maxOf(redScore, darkScore)
-            response[idx] = score
-            candidate[idx] = score >= 0.35f
-        }
+                val idx = y * w + x
+                val o = pixels[idx]
+                val b = blurred[idx]
 
-        // Keep only compact acne-sized connected components.  This is the key
-        // guard that rejects broad flushing, nose/cheek shadows and skin-tone
-        // gradients which a per-pixel threshold cannot distinguish from spots.
-        val accepted = BooleanArray(w * h)
-        val seen = BooleanArray(w * h)
-        val queue = IntArray(w * h)
-        // Was 0.000004 (≈2px for a typical selfie crop) — noise-level specks were
-        // passing the compactness filter and inflating spot counts (137/123 seen
-        // in testing) without adding any visible correction.
-        val minArea = maxOf(6, (faceWidth * faceWidth * 0.00003f).toInt())
-        val maxArea = maxOf(80, (faceWidth * faceWidth * 0.0025f).toInt())
-        var components = 0
-        var acceptedPixels = 0
-        data class SpotInfo(val area: Int, val cx: Int, val cy: Int, val meanResponse: Float, val compactness: Float)
-        val spotLog = mutableListOf<SpotInfo>()
+                val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
+                val bR = b shr 16 and 0xFF; val bG = b shr 8 and 0xFF; val bB = b and 0xFF
 
-        for (seed in candidate.indices) {
-            if (!candidate[seed] || seen[seed]) continue
-            var head = 0; var tail = 0
-            queue[tail++] = seed; seen[seed] = true
-            var area = 0; var left = w; var right = 0; var top = h; var bottom = 0
-            while (head < tail) {
-                val p = queue[head++]
-                val px = p % w; val py = p / w
-                area++
-                left = minOf(left, px); right = maxOf(right, px)
-                top = minOf(top, py); bottom = maxOf(bottom, py)
-                for (dy in -1..1) for (dx in -1..1) {
-                    if (dx == 0 && dy == 0) continue
-                    val nx = px + dx; val ny = py + dy
-                    if (nx !in 0 until w || ny !in 0 until h) continue
-                    val ni = ny * w + nx
-                    if (candidate[ni] && !seen[ni]) {
-                        seen[ni] = true
-                        queue[tail++] = ni
-                    }
+                // Calculate true perceptual luminance
+                val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
+                val bLuma = 0.299f * bR + 0.587f * bG + 0.114f * bB
+
+                // The core logic of the commercial app: 
+                // Measure contrast against the background to find facial features.
+                val lumaDiff = Math.abs(oLuma - bLuma)
+
+                // Edge Protection Gate:
+                // 0 to 25 diff: Pure skin or mid-tone blemishes (red/blue dots) -> fully blurred.
+                // 25 to 60 diff: Soft transition.
+                // > 60 diff: Hard features (black dot, eyelashes, lips) -> 100% protected.
+                val edgeProtection = smoothstep(25f, 60f, lumaDiff) 
+
+                // The inverse of edge protection determines how much blur we apply
+                val blurAmount = (1f - edgeProtection) * maskVal * globalIntensity
+
+                if (blurAmount > 0.01f) {
+                    val fR = (oR + (bR - oR) * blurAmount).toInt().coerceIn(0, 255)
+                    val fG = (oG + (bG - oG) * blurAmount).toInt().coerceIn(0, 255)
+                    val fB = (oB + (bB - oB) * blurAmount).toInt().coerceIn(0, 255)
+
+                    val alphaCh = o ushr 24
+                    pixels[idx] = (alphaCh shl 24) or (fR shl 16) or (fG shl 8) or fB
+                    
+                    hits++
+                    alphaSum += blurAmount
                 }
             }
-            val boxArea = (right - left + 1) * (bottom - top + 1)
-            val compactness = area.toFloat() / boxArea.coerceAtLeast(1)
-            if (area in minArea..maxArea && compactness >= 0.16f) {
-                components++
-                var responseSum = 0f
-                for (i in 0 until tail) { accepted[queue[i]] = true; responseSum += response[queue[i]] }
-                acceptedPixels += area
-                spotLog.add(SpotInfo(area, (left + right) / 2, (top + bottom) / 2, responseSum / area, compactness))
-            }
         }
 
-        if (components == 0) {
-            onDebugLog?.invoke("Blemish v5: 0 compact spots accepted")
-            return src
-        }
-
-        val alphaMap = Array(h) { FloatArray(w) }
-        val userStrength = strength.coerceIn(0f, 1f)
-        for (i in accepted.indices) if (accepted[i]) {
-            // `response` is detection confidence, not correction intensity.
-            // Applying it directly made even a full-strength user setting blend
-            // a detected pimple at about 28% (as the submitted debug showed).
-            // Once a compact component is accepted, repair it decisively.
-            val repairAlpha = 0.62f + 0.36f * response[i]
-            alphaMap[i / w][i % w] = (repairAlpha * userStrength).coerceIn(0f, 0.98f)
-        }
-        // Feather boundaries only; do not blur the detector before component
-        // selection, because that reconnects nearby spots into broad regions.
-        val alpha = preBlurMask(alphaMap, w, h, 1)
-
-        var finalPixels = 0
-        var alphaSum = 0f
-        var deltaSum = 0f
-        for (y in 0 until h) for (x in 0 until w) {
-            val a = alpha[y][x]
-            if (a < 0.02f || mask[y][x] < 0.5f) continue
-            val idx = y * w + x
-            val o = pixels[idx]; val n = narrow[idx]; val b = baseline[idx]
-            val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
-            val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
-            val bR = b shr 16 and 0xFF; val bG = b shr 8 and 0xFF; val bB = b and 0xFF
-
-            // Replace abnormal spot colour *and* local shading with nearby skin.
-            // Retaining only a small high-frequency residual avoids a flat patch.
-            val detailKeep = 0.06f
-            val tR = (bR + (oR - nR) * detailKeep).toInt().coerceIn(0, 255)
-            val tG = (bG + (oG - nG) * detailKeep).toInt().coerceIn(0, 255)
-            val tB = (bB + (oB - nB) * detailKeep).toInt().coerceIn(0, 255)
-            val target = ((o ushr 24) shl 24) or (tR shl 16) or (tG shl 8) or tB
-            val corrected = blendPixel(o, target, a)
-            deltaSum += (kotlin.math.abs((corrected shr 16 and 0xFF) - oR) +
-                    kotlin.math.abs((corrected shr 8 and 0xFF) - oG) +
-                    kotlin.math.abs((corrected and 0xFF) - oB)) / 3f
-            pixels[idx] = corrected
-            finalPixels++
-            alphaSum += a
+        if (hits > 0) {
+            val msg = "Commercial Surface Blur: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
+            android.util.Log.d("BLEMISH_DEBUG", msg)
+            onDebugLog?.invoke(msg)
         }
 
         src.setPixels(pixels, 0, w, 0, 0, w, h)
-        val msg = "Blemish v5: %d spots, %d/%d px, mean alpha %.2f, mean RGB Δ %.1f (r=%d)"
-            .format(components, finalPixels, acceptedPixels, alphaSum / finalPixels.coerceAtLeast(1),
-                deltaSum / finalPixels.coerceAtLeast(1), localRadius)
-        android.util.Log.d("BLEMISH_DEBUG", msg)
-        onDebugLog?.invoke(msg)
-
-        // Populate the "first 5 hits" the debug panel already promises but was
-        // never fed — sorted largest-first, since the visually noticeable spots
-        // are the ones worth inspecting individually rather than averaged away.
-        spotLog.sortedByDescending { it.area }.take(5).forEachIndexed { i, s ->
-            val alphaAtCentroid = (0.62f + 0.36f * s.meanResponse) * userStrength
-            val hitMsg = "  hit %d: area=%dpx @(%d,%d) response=%.2f compactness=%.2f alpha≈%.2f"
-                .format(i + 1, s.area, s.cx, s.cy, s.meanResponse, s.compactness, alphaAtCentroid.coerceIn(0f, 0.98f))
-            android.util.Log.d("BLEMISH_DEBUG", hitMsg)
-            onDebugLog?.invoke(hitMsg)
-        }
         return src
     }
 
-    /**
-     * Pass 2 of blemish handling. `applyBlemishReduction` above only accepts
-     * compact, pimple-sized connected components (area-gated, compactness-gated)
-     * so it deliberately ignores broad, connected redness — widespread acne
-     * flush, rosacea-like blotches, large irregular patches. Left alone, those
-     * cases hit the `components == 0` early-return and get zero correction.
-     *
-     * This pass has no component/area gating at all: it computes a large-radius
-     * local baseline (what this *region* of skin should look like, not a global
-     * face average) and pulls each pixel's red-channel excess over that baseline
-     * down by a fraction, rather than replacing the pixel. Green/blue and overall
-     * luminance are left untouched, so skin texture and any natural, faint blush
-     * survive — this is an amplitude reduction, not a paint-over.
-     */
-    private fun applyDiffuseRednessReduction(
-        src: Bitmap,
-        mask: Array<FloatArray>,
-        strength: Float,
-        onDebugLog: ((String) -> Unit)? = null
-    ): Bitmap {
-        val w = src.width
-        val h = src.height
-        val pixels = IntArray(w * h)
-        src.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        // Radius must scale off the actual face size, not the raw bitmap width.
-        // Sizing off `w` capped the blur at 70px in testing, which is nowhere
-        // near wide enough to see past a large cheek blotch to real clear skin —
-        // the "baseline" ended up sampling the blotch itself, which understated
-        // redExcess and made the correction imperceptible (mean reduction ~4/255
-        // on screen). Use the same face-oval bounding box pass 1 uses.
-        var minX = w; var maxX = -1; var minY = h; var maxY = -1
-        for (y in 0 until h) for (x in 0 until w) {
-            if (mask[y][x] >= 0.5f) {
-                minX = minOf(minX, x); maxX = maxOf(maxX, x)
-                minY = minOf(minY, y); maxY = maxOf(maxY, y)
-            }
-        }
-        if (maxX < minX || maxY < minY) return src
-        val faceWidth = (maxX - minX + 1).coerceAtLeast(1)
-
-        // Large radius relative to *face* width — big enough to reach past an
-        // entire blotch to genuinely unaffected skin, rather than resampling
-        // the blotch itself into its own baseline.
-        val localRadius = (faceWidth * DIFFUSE_RADIUS_FRACTION).toInt()
-            .coerceIn(DIFFUSE_RADIUS_MIN, DIFFUSE_RADIUS_MAX)
-        val baseline = gaussianBlur(pixels, w, h, localRadius)
-
-        val out = pixels.copyOf()
-        val userStrength = strength.coerceIn(0f, 1f)
-        var touchedPixels = 0
-        var excessSum = 0f
-        var reduceSum = 0f
-
-        for (y in 0 until h) for (x in 0 until w) {
-            val idx = y * w + x
-            if (mask[y][x] < 0.5f) continue
-
-            val o = pixels[idx]
-            val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
-            val b = baseline[idx]
-            val bR = b shr 16 and 0xFF; val bG = b shr 8 and 0xFF
-
-            // Redness measured against this region's own smoothed baseline, so
-            // globally warm lighting or an even, healthy skin tone is not
-            // penalised — only local excess (a blotch sitting on top of it) is.
-            val redExcess = (oR - oG) - (bR - bG).toFloat()
-            if (redExcess <= DIFFUSE_REDNESS_FLOOR) continue
-
-            val reduceBy = (redExcess * DIFFUSE_MAX_REDUCTION_FRACTION * userStrength)
-                .coerceIn(0f, redExcess)
-            val tR = (oR - reduceBy).toInt().coerceIn(0, 255)
-            out[idx] = (o and 0xFF000000.toInt()) or (tR shl 16) or (oG shl 8) or oB
-
-            touchedPixels++
-            excessSum += redExcess
-            reduceSum += reduceBy
-        }
-
-        val result = src.copy(Bitmap.Config.ARGB_8888, true)
-        result.setPixels(out, 0, w, 0, 0, w, h)
-
-        val msg = "Diffuse redness: %d px touched, mean excess %.1f, mean reduction %.1f (r=%d)"
-            .format(touchedPixels, excessSum / touchedPixels.coerceAtLeast(1),
-                reduceSum / touchedPixels.coerceAtLeast(1), localRadius)
-        android.util.Log.d("BLEMISH_DEBUG", msg)
-        onDebugLog?.invoke(msg)
-        return result
-    }
 
     private fun applyUnderEyeReduction(
         src: Bitmap,
@@ -1436,20 +1208,6 @@ class ApplyBeautyUseCase {
         private const val MAX_UNDER_EYE_LIFT        = 60f
         private const val EYE_BAG_BLUR_RADIUS       = 30f
         private const val EYES_BLUR_RADIUS          = 2f
-
-        // Diffuse redness (pass 2 of blemish handling) — no area/compactness
-        // gate, so these constants control amplitude only, not acceptance.
-        // Radius is now a fraction of *face* width (see applyDiffuseRednessReduction);
-        // 0.18 puts the kernel comfortably wider than a large cheek blotch so the
-        // baseline reaches genuinely clear skin instead of resampling the blotch.
-        private const val DIFFUSE_RADIUS_FRACTION        = 0.18f
-        private const val DIFFUSE_RADIUS_MIN             = 40
-        private const val DIFFUSE_RADIUS_MAX             = 160
-        private const val DIFFUSE_REDNESS_FLOOR          = 2f
-        // Raised from 0.5 — with an honestly-measured excess, 0.5 still left a
-        // visibly reddish result on screen. 0.75 leaves a faint natural tinge
-        // (matching the reference "after" shots) rather than fully flattening.
-        private const val DIFFUSE_MAX_REDUCTION_FRACTION = 0.75f
 
         // Sharpening
         private const val SHARPEN_BLUR_RADIUS       = 2
