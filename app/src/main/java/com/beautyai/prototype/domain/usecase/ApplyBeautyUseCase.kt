@@ -30,8 +30,26 @@ class ApplyBeautyUseCase {
         // multiplying the segmentation mask by this kills any body-skin false
         // positive that isn't near the face outline (e.g. a hand in frame),
         // since the segmentation model has no notion of "this is a hand."
+        //
+        // FEATURE_FACE_OVAL's apex is landmark 10 — MediaPipe's single fixed
+        // forehead-top point, which sits below the actual hairline on many
+        // faces/head angles. Anything above it (e.g. a forehead pimple near
+        // the hairline) was getting multiplied by zero here regardless of how
+        // strong the blemish passes were. Dilate the polygon outward before
+        // drawing so it reaches further into the forehead; this is safe
+        // because `refinedMask` (real segmentation, multiplied in below) still
+        // excludes hair/background, so this only recovers forehead skin that
+        // the geometric oval had wrongly cut off.
+        var ovalMinX = source.width.toFloat(); var ovalMaxX = 0f
+        for (idx in FEATURE_FACE_OVAL) {
+            val lm = faceData.landmarks[idx]
+            ovalMinX = minOf(ovalMinX, lm.x * source.width)
+            ovalMaxX = maxOf(ovalMaxX, lm.x * source.width)
+        }
+        val ovalFaceWidth = (ovalMaxX - ovalMinX).coerceAtLeast(1f)
         val faceOvalMask = createFeatureMask(
-            faceData, listOf(FEATURE_FACE_OVAL), source.width, source.height, 35f
+            faceData, listOf(FEATURE_FACE_OVAL), source.width, source.height, 35f,
+            expansion = ovalFaceWidth * 0.10f
         )
 
         // 3a. Smooth mask — segmentation-based (includes neck/body-skin at the
@@ -362,7 +380,10 @@ class ApplyBeautyUseCase {
         val accepted = BooleanArray(w * h)
         val seen = BooleanArray(w * h)
         val queue = IntArray(w * h)
-        val minArea = maxOf(2, (faceWidth * faceWidth * 0.000004f).toInt())
+        // Was 0.000004 (≈2px for a typical selfie crop) — noise-level specks were
+        // passing the compactness filter and inflating spot counts (137/123 seen
+        // in testing) without adding any visible correction.
+        val minArea = maxOf(6, (faceWidth * faceWidth * 0.00003f).toInt())
         val maxArea = maxOf(80, (faceWidth * faceWidth * 0.0025f).toInt())
         var components = 0
         var acceptedPixels = 0
@@ -479,10 +500,26 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // Large radius relative to image width — big enough to average across
-        // an entire blotch/cheek region rather than resampling the blotch itself
-        // (which is what a small radius baseline would do).
-        val localRadius = (w * DIFFUSE_RADIUS_FRACTION).toInt()
+        // Radius must scale off the actual face size, not the raw bitmap width.
+        // Sizing off `w` capped the blur at 70px in testing, which is nowhere
+        // near wide enough to see past a large cheek blotch to real clear skin —
+        // the "baseline" ended up sampling the blotch itself, which understated
+        // redExcess and made the correction imperceptible (mean reduction ~4/255
+        // on screen). Use the same face-oval bounding box pass 1 uses.
+        var minX = w; var maxX = -1; var minY = h; var maxY = -1
+        for (y in 0 until h) for (x in 0 until w) {
+            if (mask[y][x] >= 0.5f) {
+                minX = minOf(minX, x); maxX = maxOf(maxX, x)
+                minY = minOf(minY, y); maxY = maxOf(maxY, y)
+            }
+        }
+        if (maxX < minX || maxY < minY) return src
+        val faceWidth = (maxX - minX + 1).coerceAtLeast(1)
+
+        // Large radius relative to *face* width — big enough to reach past an
+        // entire blotch to genuinely unaffected skin, rather than resampling
+        // the blotch itself into its own baseline.
+        val localRadius = (faceWidth * DIFFUSE_RADIUS_FRACTION).toInt()
             .coerceIn(DIFFUSE_RADIUS_MIN, DIFFUSE_RADIUS_MAX)
         val baseline = gaussianBlur(pixels, w, h, localRadius)
 
@@ -1387,11 +1424,17 @@ class ApplyBeautyUseCase {
 
         // Diffuse redness (pass 2 of blemish handling) — no area/compactness
         // gate, so these constants control amplitude only, not acceptance.
-        private const val DIFFUSE_RADIUS_FRACTION        = 0.06f
-        private const val DIFFUSE_RADIUS_MIN             = 25
-        private const val DIFFUSE_RADIUS_MAX             = 70
+        // Radius is now a fraction of *face* width (see applyDiffuseRednessReduction);
+        // 0.18 puts the kernel comfortably wider than a large cheek blotch so the
+        // baseline reaches genuinely clear skin instead of resampling the blotch.
+        private const val DIFFUSE_RADIUS_FRACTION        = 0.18f
+        private const val DIFFUSE_RADIUS_MIN             = 40
+        private const val DIFFUSE_RADIUS_MAX             = 160
         private const val DIFFUSE_REDNESS_FLOOR          = 2f
-        private const val DIFFUSE_MAX_REDUCTION_FRACTION = 0.5f
+        // Raised from 0.5 — with an honestly-measured excess, 0.5 still left a
+        // visibly reddish result on screen. 0.75 leaves a faint natural tinge
+        // (matching the reference "after" shots) rather than fully flattening.
+        private const val DIFFUSE_MAX_REDUCTION_FRACTION = 0.75f
 
         // Sharpening
         private const val SHARPEN_BLUR_RADIUS       = 2
