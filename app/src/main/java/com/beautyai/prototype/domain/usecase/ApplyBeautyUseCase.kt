@@ -281,7 +281,7 @@ class ApplyBeautyUseCase {
     }
 
     /**
-     * BLEMISH REDUCTION v4
+     * BLEMISH REDUCTION v5
      *
      * Detects compact, locally red / dark spots on the protected facial-skin
      * mask, then replaces their colour and shading with a local skin estimate.
@@ -310,7 +310,10 @@ class ApplyBeautyUseCase {
         }
         if (maxX < minX || maxY < minY) return src
         val faceWidth = (maxX - minX + 1).coerceAtLeast(1)
-        val localRadius = (faceWidth * 0.012f).toInt().coerceIn(5, 14)
+        // r=5 (seen in the debug output) samples mostly *inside* a typical
+        // 12–30 px pimple, making the supposed skin target almost identical to
+        // the defect. Use a surrounding-skin scale instead.
+        val localRadius = (faceWidth * 0.040f).toInt().coerceIn(12, 30)
         val narrowRadius = 1
 
         // `gaussianBlur` is a separable box blur in this class.  Here it is a
@@ -385,14 +388,19 @@ class ApplyBeautyUseCase {
         }
 
         if (components == 0) {
-            onDebugLog?.invoke("Blemish v4: 0 compact spots accepted")
+            onDebugLog?.invoke("Blemish v5: 0 compact spots accepted")
             return src
         }
 
         val alphaMap = Array(h) { FloatArray(w) }
         val userStrength = strength.coerceIn(0f, 1f)
         for (i in accepted.indices) if (accepted[i]) {
-            alphaMap[i / w][i % w] = (response[i] * userStrength).coerceIn(0f, 0.90f)
+            // `response` is detection confidence, not correction intensity.
+            // Applying it directly made even a full-strength user setting blend
+            // a detected pimple at about 28% (as the submitted debug showed).
+            // Once a compact component is accepted, repair it decisively.
+            val repairAlpha = 0.62f + 0.36f * response[i]
+            alphaMap[i / w][i % w] = (repairAlpha * userStrength).coerceIn(0f, 0.98f)
         }
         // Feather boundaries only; do not blur the detector before component
         // selection, because that reconnects nearby spots into broad regions.
@@ -412,7 +420,7 @@ class ApplyBeautyUseCase {
 
             // Replace abnormal spot colour *and* local shading with nearby skin.
             // Retaining only a small high-frequency residual avoids a flat patch.
-            val detailKeep = 0.18f
+            val detailKeep = 0.06f
             val tR = (bR + (oR - nR) * detailKeep).toInt().coerceIn(0, 255)
             val tG = (bG + (oG - nG) * detailKeep).toInt().coerceIn(0, 255)
             val tB = (bB + (oB - nB) * detailKeep).toInt().coerceIn(0, 255)
@@ -427,7 +435,7 @@ class ApplyBeautyUseCase {
         }
 
         src.setPixels(pixels, 0, w, 0, 0, w, h)
-        val msg = "Blemish v4: %d spots, %d/%d px, mean alpha %.2f, mean RGB Δ %.1f (r=%d)"
+        val msg = "Blemish v5: %d spots, %d/%d px, mean alpha %.2f, mean RGB Δ %.1f (r=%d)"
             .format(components, finalPixels, acceptedPixels, alphaSum / finalPixels.coerceAtLeast(1),
                 deltaSum / finalPixels.coerceAtLeast(1), localRadius)
         android.util.Log.d("BLEMISH_DEBUG", msg)
