@@ -356,7 +356,7 @@ class ApplyBeautyUseCase {
 
                 val rednessMid = (mR - mG) - (lR - lG).toFloat()
                 val persistence = rednessMid / rednessBand.coerceAtLeast(1f)
-                val sizeProtection = 1f - smoothstep(0.75f, 1.0f, persistence)
+                val sizeProtection = 1f - smoothstep(0.90f, 1.0f, persistence)
 
                 val a = (likeness * moleProtection * specProtection *
                         sizeProtection * maskVal * globalIntensity)
