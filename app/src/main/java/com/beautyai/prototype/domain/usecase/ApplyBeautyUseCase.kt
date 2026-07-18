@@ -290,7 +290,8 @@ class ApplyBeautyUseCase {
 
         // 1. Radii for Frequency Separation
         val narrowRadius = (w * 0.002f).toInt().coerceIn(1, 4)
-        val wideRadius = (w * 0.025f).toInt().coerceIn(8, 24)
+        // Increased wide radius slightly to pull cleaner skin from outside large acne clusters
+        val wideRadius = (w * 0.035f).toInt().coerceIn(12, 32) 
 
         val narrow = gaussianBlur(pixels, w, h, narrowRadius)
         val wide = gaussianBlur(pixels, w, h, wideRadius)
@@ -299,7 +300,7 @@ class ApplyBeautyUseCase {
         var alphaSum = 0f
 
         val globalIntensity = strength.coerceIn(0f, 1f)
-        val maxAlpha = 0.90f // Higher cap to ensure the correction is highly visible
+        val maxAlpha = 0.95f // High cap for maximum coverage
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -309,27 +310,27 @@ class ApplyBeautyUseCase {
                 val idx = y * w + x
                 val o = pixels[idx]
                 val n = narrow[idx]
-                val t = wide[idx] // Target (low frequency healthy skin)
+                val t = wide[idx]
 
+                val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
                 val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
                 val tR = t shr 16 and 0xFF; val tG = t shr 8 and 0xFF; val tB = t and 0xFF
 
-                // A. Redness Detection (Acne/Inflammation)
+                // A. Redness Detection
                 val nRedness = nR - nG
                 val tRedness = tR - tG
                 val rednessSpike = (nRedness - tRedness).toFloat()
-                val rednessAlpha = smoothstep(4f, 18f, rednessSpike)
+                val rednessAlpha = smoothstep(2f, 15f, rednessSpike)
 
-                // B. Luma Detection (Dark spots / pores)
+                // B. Luma Detection
                 val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
                 val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
                 val lumaDip = tLuma - nLuma
-                val lumaAlpha = smoothstep(8f, 25f, lumaDip)
+                val lumaAlpha = smoothstep(5f, 20f, lumaDip)
 
-                // C. Mole / Deep Shadow Protection (Ignore extremely dark spots compared to surrounding)
-                val shadowProtection = 1f - smoothstep(35f, 60f, lumaDip)
+                // C. Shadow/Mole Protection
+                val shadowProtection = 1f - smoothstep(30f, 50f, lumaDip)
 
-                // Combine detection
                 var a = maxOf(rednessAlpha, lumaAlpha) * shadowProtection * maskVal * globalIntensity
                 a = a.coerceIn(0f, maxAlpha)
 
@@ -338,26 +339,39 @@ class ApplyBeautyUseCase {
                 hits++
                 alphaSum += a
 
-                // 2. Frequency Separation Blend (The Magic Formula)
-                // Formula: Original + (Target - Narrow) * Alpha
-                val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
+                // 2. Luminance-Only Frequency Separation (The Anti-Grey Fix)
+                // Extract ONLY the grayscale texture (pores/bumps) from the high frequencies.
+                val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
+                val textureDetail = oLuma - nLuma
 
-                val fR = (oR + (tR - nR) * a).toInt().coerceIn(0, 255)
-                val fG = (oG + (tG - nG) * a).toInt().coerceIn(0, 255)
-                val fB = (oB + (tB - nB) * a).toInt().coerceIn(0, 255)
+                // Add the pure grayscale texture onto the clean target color
+                val idealR = tR + textureDetail
+                val idealG = tG + textureDetail
+                val idealB = tB + textureDetail
+
+                var fR = (oR + (idealR - oR) * a).toInt()
+                var fG = (oG + (idealG - oG) * a).toInt()
+                var fB = (oB + (idealB - oB) * a).toInt()
+
+                // 3. The Ashy Protector
+                // Human skin MUST be warm. If the red channel drops too low, 
+                // gently lift it to prevent grey/green dead spots.
+                if (fR < fG + 8) fR = fG + 8
 
                 val alphaCh = o ushr 24
-                pixels[idx] = (alphaCh shl 24) or (fR shl 16) or (fG shl 8) or fB
+                pixels[idx] = (alphaCh shl 24) or 
+                              (fR.coerceIn(0, 255) shl 16) or 
+                              (fG.coerceIn(0, 255) shl 8) or 
+                              fB.coerceIn(0, 255)
             }
         }
 
         if (hits > 0) {
-            val msg = "Blemish FS: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
+            val msg = "Blemish Luma-FS: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
             android.util.Log.d("BLEMISH_DEBUG", msg)
             onDebugLog?.invoke(msg)
         }
 
-        // Memory fix: Reuse the existing mutable bitmap instead of allocating a copy
         src.setPixels(pixels, 0, w, 0, 0, w, h)
         return src
     }
