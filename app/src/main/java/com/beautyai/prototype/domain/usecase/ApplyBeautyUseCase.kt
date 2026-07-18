@@ -387,6 +387,8 @@ class ApplyBeautyUseCase {
         val maxArea = maxOf(80, (faceWidth * faceWidth * 0.0025f).toInt())
         var components = 0
         var acceptedPixels = 0
+        data class SpotInfo(val area: Int, val cx: Int, val cy: Int, val meanResponse: Float, val compactness: Float)
+        val spotLog = mutableListOf<SpotInfo>()
 
         for (seed in candidate.indices) {
             if (!candidate[seed] || seen[seed]) continue
@@ -414,8 +416,10 @@ class ApplyBeautyUseCase {
             val compactness = area.toFloat() / boxArea.coerceAtLeast(1)
             if (area in minArea..maxArea && compactness >= 0.16f) {
                 components++
-                for (i in 0 until tail) accepted[queue[i]] = true
+                var responseSum = 0f
+                for (i in 0 until tail) { accepted[queue[i]] = true; responseSum += response[queue[i]] }
                 acceptedPixels += area
+                spotLog.add(SpotInfo(area, (left + right) / 2, (top + bottom) / 2, responseSum / area, compactness))
             }
         }
 
@@ -472,6 +476,17 @@ class ApplyBeautyUseCase {
                 deltaSum / finalPixels.coerceAtLeast(1), localRadius)
         android.util.Log.d("BLEMISH_DEBUG", msg)
         onDebugLog?.invoke(msg)
+
+        // Populate the "first 5 hits" the debug panel already promises but was
+        // never fed — sorted largest-first, since the visually noticeable spots
+        // are the ones worth inspecting individually rather than averaged away.
+        spotLog.sortedByDescending { it.area }.take(5).forEachIndexed { i, s ->
+            val alphaAtCentroid = (0.62f + 0.36f * s.meanResponse) * userStrength
+            val hitMsg = "  hit %d: area=%dpx @(%d,%d) response=%.2f compactness=%.2f alpha≈%.2f"
+                .format(i + 1, s.area, s.cx, s.cy, s.meanResponse, s.compactness, alphaAtCentroid.coerceIn(0f, 0.98f))
+            android.util.Log.d("BLEMISH_DEBUG", hitMsg)
+            onDebugLog?.invoke(hitMsg)
+        }
         return src
     }
 
