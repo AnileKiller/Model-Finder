@@ -89,14 +89,22 @@ class ApplyBeautyUseCase {
             // Pass 1: decisive repair of discrete, compact spots (pimples, small
             // marks). Component-area-gated, so broad/connected redness is
             // deliberately left untouched here and picked up by pass 2 instead.
-            result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
+            // Also returns the candidate mask it detected, so pass 2's baseline
+            // can avoid sampling any pixel pass 1 already flagged as blemish-like
+            // (prevents nearby spots bleeding into each other's baseline).
+            val (blemishResult, blemishCandidates) = applyBlemishReduction(
+                result, blemishMask, effective.blemishReduction, onDebugLog
+            )
+            result = blemishResult
 
             // Pass 2: gentle amplitude reduction of diffuse redness/erythema
             // (acne flush, broad blotchy patches) that pass 1's compact-component
             // gate intentionally rejects. Scales the red channel down toward the
             // region's own local baseline rather than replacing pixels outright,
             // so texture and any faint natural blush survive.
-            result = applyDiffuseRednessReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
+            result = applyDiffuseRednessReduction(
+                result, blemishMask, effective.blemishReduction, blemishCandidates, onDebugLog
+            )
         }
 
         if (effective.skinBrightness > 0f)
@@ -322,7 +330,7 @@ class ApplyBeautyUseCase {
         mask: Array<FloatArray>,
         strength: Float,
         onDebugLog: ((String) -> Unit)? = null
-    ): Bitmap {
+    ): Pair<Bitmap, BooleanArray> {
         val w = src.width
         val h = src.height
         val pixels = IntArray(w * h)
@@ -337,12 +345,20 @@ class ApplyBeautyUseCase {
                 minY = minOf(minY, y); maxY = maxOf(maxY, y)
             }
         }
-        if (maxX < minX || maxY < minY) return src
+        if (maxX < minX || maxY < minY) return src to BooleanArray(w * h)
         val faceWidth = (maxX - minX + 1).coerceAtLeast(1)
         // r=5 (seen in the debug output) samples mostly *inside* a typical
         // 12–30 px pimple, making the supposed skin target almost identical to
         // the defect. Use a surrounding-skin scale instead.
-        val localRadius = (faceWidth * 0.040f).toInt().coerceIn(12, 30)
+        //
+        // Still not wide enough: the largest accepted spot (maxArea, radius
+        // ~13px) only got a 18px-radius baseline kernel — ~1.4x its own size —
+        // so the "clean skin" sample was still substantially the spot itself.
+        // A per-spot debug hit showed alpha≈0.89 (near ceiling) yet stayed
+        // visibly present for exactly this reason: high alpha toward a dirty
+        // baseline still isn't clean. Widen so the kernel comfortably clears
+        // even the biggest legal spot (maxArea diameter, see below).
+        val localRadius = (faceWidth * 0.065f).toInt().coerceIn(20, 48)
         val narrowRadius = 1
 
         // `gaussianBlur` is a separable box blur in this class.  Here it is a
@@ -373,6 +389,15 @@ class ApplyBeautyUseCase {
             response[idx] = score
             candidate[idx] = score >= 0.35f
         }
+
+        // Detection uses the naive blur above — fine here, since detection
+        // only needs to be sensitive enough to flag both a spot's own pixels
+        // and, incidentally, a nearby spot's pixels too (both should score
+        // high individually). The problem was only ever the *repair target*:
+        // reusing this same contaminated baseline as "what clean skin looks
+        // like" is what caused two nearby spots to bleed into each other.
+        // Recompute a clean version that skips every already-flagged pixel.
+        val cleanBaseline = maskedBoxBlur(pixels, w, h, localRadius, candidate)
 
         // Keep only compact acne-sized connected components.  This is the key
         // guard that rejects broad flushing, nose/cheek shadows and skin-tone
@@ -425,7 +450,7 @@ class ApplyBeautyUseCase {
 
         if (components == 0) {
             onDebugLog?.invoke("Blemish v5: 0 compact spots accepted")
-            return src
+            return src to candidate
         }
 
         val alphaMap = Array(h) { FloatArray(w) }
@@ -449,7 +474,7 @@ class ApplyBeautyUseCase {
             val a = alpha[y][x]
             if (a < 0.02f || mask[y][x] < 0.5f) continue
             val idx = y * w + x
-            val o = pixels[idx]; val n = narrow[idx]; val b = baseline[idx]
+            val o = pixels[idx]; val n = narrow[idx]; val b = cleanBaseline[idx]
             val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
             val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
             val bR = b shr 16 and 0xFF; val bG = b shr 8 and 0xFF; val bB = b and 0xFF
@@ -487,7 +512,7 @@ class ApplyBeautyUseCase {
             android.util.Log.d("BLEMISH_DEBUG", hitMsg)
             onDebugLog?.invoke(hitMsg)
         }
-        return src
+        return src to candidate
     }
 
     /**
@@ -508,6 +533,7 @@ class ApplyBeautyUseCase {
         src: Bitmap,
         mask: Array<FloatArray>,
         strength: Float,
+        excludeFromBaseline: BooleanArray,
         onDebugLog: ((String) -> Unit)? = null
     ): Bitmap {
         val w = src.width
@@ -536,7 +562,11 @@ class ApplyBeautyUseCase {
         // the blotch itself into its own baseline.
         val localRadius = (faceWidth * DIFFUSE_RADIUS_FRACTION).toInt()
             .coerceIn(DIFFUSE_RADIUS_MIN, DIFFUSE_RADIUS_MAX)
-        val baseline = gaussianBlur(pixels, w, h, localRadius)
+        // Excludes every pixel pass 1 already flagged as blemish-like, so this
+        // (much larger-radius) baseline can't sample another spot entirely —
+        // the same cross-contamination bug as pass 1 had, just worse here
+        // since this radius reaches even further (up to 160px).
+        val baseline = maskedBoxBlur(pixels, w, h, localRadius, excludeFromBaseline)
 
         val out = pixels.copyOf()
         val userStrength = strength.coerceIn(0f, 1f)
@@ -916,6 +946,83 @@ class ApplyBeautyUseCase {
                 val addY = (y + radius + 1).coerceIn(0, h - 1)
                 val subY = (y - radius).coerceIn(0, h - 1)
                 sum += tmp[addY][x] - tmp[subY][x]
+            }
+        }
+        return out
+    }
+
+    /**
+     * Same separable box blur as [gaussianBlur], except pixels flagged in
+     * [exclude] contribute nothing to the running sum/count — so each output
+     * pixel is an average of nearby *non-excluded* pixels only.
+     *
+     * Why this exists: a plain blur used as a "clean skin" baseline breaks
+     * down whenever two differently-coloured regions sit within one radius of
+     * each other — confirmed with a synthetic red-dot/blue-dot adjacency
+     * test, where the naive baseline averaged the two dots into each other
+     * (a blue spot's centre came back red, and vice versa, because the
+     * kernel spanned both). Passing the detector's own candidate mask as
+     * [exclude] guarantees the baseline never samples another already-flagged
+     * blemish pixel, regardless of proximity or size.
+     *
+     * This is an approximate *separable* masked blur (each 1D pass ignores
+     * excluded pixels independently) rather than a true 2D masked average —
+     * cheap and good enough here, since the goal is just "never touch a
+     * flagged pixel," not per-pixel-exact weighting.
+     */
+    private fun maskedBoxBlur(src: IntArray, w: Int, h: Int, radius: Int, exclude: BooleanArray): IntArray {
+        if (radius <= 0) return src
+        val tmpR = FloatArray(w * h); val tmpG = FloatArray(w * h); val tmpB = FloatArray(w * h)
+        val out = IntArray(w * h)
+
+        for (y in 0 until h) {
+            var rSum = 0; var gSum = 0; var bSum = 0; var cnt = 0
+            for (k in -radius..radius) {
+                val idx = y * w + k.coerceIn(0, w - 1)
+                if (!exclude[idx]) {
+                    val px = src[idx]
+                    rSum += px shr 16 and 0xFF; gSum += px shr 8 and 0xFF; bSum += px and 0xFF; cnt++
+                }
+            }
+            for (x in 0 until w) {
+                val idx = y * w + x
+                if (cnt > 0) {
+                    tmpR[idx] = rSum / cnt.toFloat(); tmpG[idx] = gSum / cnt.toFloat(); tmpB[idx] = bSum / cnt.toFloat()
+                } else {
+                    val px = src[idx]
+                    tmpR[idx] = (px shr 16 and 0xFF).toFloat(); tmpG[idx] = (px shr 8 and 0xFF).toFloat(); tmpB[idx] = (px and 0xFF).toFloat()
+                }
+                val addIdx = y * w + (x + radius + 1).coerceIn(0, w - 1)
+                val subIdx = y * w + (x - radius).coerceIn(0, w - 1)
+                if (!exclude[addIdx]) {
+                    val add = src[addIdx]
+                    rSum += add shr 16 and 0xFF; gSum += add shr 8 and 0xFF; bSum += add and 0xFF; cnt++
+                }
+                if (!exclude[subIdx]) {
+                    val sub = src[subIdx]
+                    rSum -= sub shr 16 and 0xFF; gSum -= sub shr 8 and 0xFF; bSum -= sub and 0xFF; cnt--
+                }
+            }
+        }
+
+        for (x in 0 until w) {
+            var rSum = 0f; var gSum = 0f; var bSum = 0f; var cnt = 0
+            for (k in -radius..radius) {
+                val idx = k.coerceIn(0, h - 1) * w + x
+                if (!exclude[idx]) { rSum += tmpR[idx]; gSum += tmpG[idx]; bSum += tmpB[idx]; cnt++ }
+            }
+            for (y in 0 until h) {
+                val idx = y * w + x
+                val (fr, fg, fb) = if (cnt > 0) Triple(rSum / cnt, gSum / cnt, bSum / cnt)
+                    else Triple(tmpR[idx], tmpG[idx], tmpB[idx])
+                out[idx] = 0xFF000000.toInt() or
+                        (fr.toInt().coerceIn(0, 255) shl 16) or
+                        (fg.toInt().coerceIn(0, 255) shl 8) or
+                        fb.toInt().coerceIn(0, 255)
+                val addIdx = (y + radius + 1).coerceIn(0, h - 1) * w + x
+                val subIdx = (y - radius).coerceIn(0, h - 1) * w + x
+                if (!exclude[addIdx]) { rSum += tmpR[addIdx]; gSum += tmpG[addIdx]; bSum += tmpB[addIdx]; cnt++ }
+                if (!exclude[subIdx]) { rSum -= tmpR[subIdx]; gSum -= tmpG[subIdx]; bSum -= tmpB[subIdx]; cnt-- }
             }
         }
         return out
