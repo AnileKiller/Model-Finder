@@ -346,7 +346,7 @@ class ApplyBeautyUseCase {
             if (a > 0.02f) { hits++; alphaSum += a }
         }
 
-        val closed = closeMask(alphaMap, w, h, detailRadius + 1)
+        val closed = closeMask(alphaMap, w, h, sizeRadius)
         val feathered = preBlurMask(closed, w, h, 1)
         val out = original.copyOf()
         for (y in 0 until h) for (x in 0 until w) {
