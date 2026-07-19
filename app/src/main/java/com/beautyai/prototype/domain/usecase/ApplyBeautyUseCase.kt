@@ -288,61 +288,136 @@ class ApplyBeautyUseCase {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        // 1. Single Heavy Blur (The "Commercial Instagram" Base)
-        // A wider radius creates that smooth, wax-like smudge over blemishes
-        val blurRadius = (w * 0.035f).toInt().coerceIn(12, 48)
-        val blurred = gaussianBlur(pixels, w, h, blurRadius)
+        // 1. 3-Tier Blurs (Size Gate protection for Lips/Features)
+        val narrowRadius = (w * 0.002f).toInt().coerceIn(1, 4)
+        val midRadius = (w * 0.020f).toInt().coerceIn(10, 32)
+        val wideRadius = (w * 0.045f).toInt().coerceIn(20, 64)
 
+        val narrow = gaussianBlur(pixels, w, h, narrowRadius)
+        val mid = gaussianBlur(pixels, w, h, midRadius)
+        val wide = gaussianBlur(pixels, w, h, wideRadius)
+
+        val alphaMap = Array(h) { FloatArray(w) }
+        val globalIntensity = strength.coerceIn(0f, 1f)
+        val maxAlpha = 0.95f 
+        
         var hits = 0
         var alphaSum = 0f
-        val globalIntensity = strength.coerceIn(0f, 1f)
 
-        // 2. Luminance-Gated Blend (O(N) Edge-Preserving Filter)
+        // ── PASS 1: Build the Alpha Map via YCbCr & Mole Ratio ────────────
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val maskVal = mask[y][x]
-                if (maskVal <= 0.02f) continue
+                if (maskVal < 0.05f) continue
+
+                val idx = y * w + x
+                val n = narrow[idx]; val m = mid[idx]; val t = wide[idx]
+
+                val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
+                val mR = m shr 16 and 0xFF; val mG = m shr 8 and 0xFF
+                val tR = t shr 16 and 0xFF; val tG = t shr 8 and 0xFF; val tB = t and 0xFF
+
+                // A. YCbCr Skin Detection (Strict Non-Skin Rejection)
+                val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
+                val cb = 128f - 0.168736f * nR - 0.331264f * nG + 0.5f * nB
+                val cr = 128f + 0.5f * nR - 0.418688f * nG - 0.081312f * nB
+                val isSkin = nLuma > 40f && cb in 77f..135f && cr in 133f..180f
+                
+                if (!isSkin) continue
+
+                // B. Excess Redness Calculation
+                val nRedness = nR - nG
+                val mRedness = mR - mG
+                val tRedness = tR - tG
+                val excessRed = (nRedness - tRedness).toFloat()
+                
+                // C. Mole & Freckle Rejection (Redness-to-Darkness Ratio)
+                val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
+                val lumaDrop = tLuma - nLuma // Positive = darker than surrounding skin
+                
+                val isDarkSpot = lumaDrop > 9f
+                val redPerDark = if (lumaDrop > 1f) excessRed / lumaDrop else 999f
+                
+                // Brown moles are dark but have low relative redness. 
+                if (isDarkSpot && redPerDark < 0.55f) continue
+
+                // D. Size Protection (Lip rejection via mid-blur persistence)
+                val midExcess = (mRedness - tRedness).toFloat()
+                val persistence = midExcess / excessRed.coerceAtLeast(1f)
+                val sizeProtection = 1f - smoothstep(0.75f, 0.98f, persistence)
+
+                // Final Alpha Assembly
+                val rednessAlpha = smoothstep(2f, 12f, excessRed)
+                val lumaAlpha = smoothstep(4f, 15f, lumaDrop)
+
+                var a = maxOf(rednessAlpha, lumaAlpha) * sizeProtection * maskVal * globalIntensity
+                a = a.coerceIn(0f, maxAlpha)
+                
+                alphaMap[y][x] = a
+                if (a > 0.02f) { hits++; alphaSum += a }
+            }
+        }
+
+        // Feather the alpha map to ensure buttery-smooth patch edges
+        val smoothAlpha = preBlurMask(alphaMap, w, h, 2)
+
+        // ── PASS 2: Luma-Preserving Chrominance Transfer ──────────────────
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val a = smoothAlpha[y][x]
+                if (a <= 0.02f) continue
 
                 val idx = y * w + x
                 val o = pixels[idx]
-                val b = blurred[idx]
+                val n = narrow[idx]
+                val t = wide[idx]
 
                 val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
-                val bR = b shr 16 and 0xFF; val bG = b shr 8 and 0xFF; val bB = b and 0xFF
+                val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
+                val tR = t shr 16 and 0xFF; val tG = t shr 8 and 0xFF; val tB = t and 0xFF
 
-                // Calculate true perceptual luminance
+                // 1. Calculate high-frequency texture (Luminance detail)
                 val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
-                val bLuma = 0.299f * bR + 0.587f * bG + 0.114f * bB
+                val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
+                val texture = oLuma - nLuma
 
-                // The core logic of the commercial app: 
-                // Measure contrast against the background to find facial features.
-                val lumaDiff = Math.abs(oLuma - bLuma)
-
-                // Edge Protection Gate:
-                // 0 to 25 diff: Pure skin or mid-tone blemishes (red/blue dots) -> fully blurred.
-                // 25 to 60 diff: Soft transition.
-                // > 60 diff: Hard features (black dot, eyelashes, lips) -> 100% protected.
-                val edgeProtection = smoothstep(25f, 60f, lumaDiff) 
-
-                // The inverse of edge protection determines how much blur we apply
-                val blurAmount = (1f - edgeProtection) * maskVal * globalIntensity
-
-                if (blurAmount > 0.01f) {
-                    val fR = (oR + (bR - oR) * blurAmount).toInt().coerceIn(0, 255)
-                    val fG = (oG + (bG - oG) * blurAmount).toInt().coerceIn(0, 255)
-                    val fB = (oB + (bB - oB) * blurAmount).toInt().coerceIn(0, 255)
-
-                    val alphaCh = o ushr 24
-                    pixels[idx] = (alphaCh shl 24) or (fR shl 16) or (fG shl 8) or fB
-                    
-                    hits++
-                    alphaSum += blurAmount
+                // 2. Clean the Target Color (Crucial for dense, severe acne patches)
+                var cleanTR = tR.toFloat()
+                var cleanTG = tG.toFloat()
+                var cleanTB = tB.toFloat()
+                
+                val targetRedness = cleanTR - cleanTG
+                
+                // This block specifically prevents the "jawline bruise"
+                if (targetRedness > 35f) {
+                    val excess = (targetRedness - 35f) * 0.5f 
+                    cleanTR -= excess
+                    cleanTG += excess * 0.5f
+                    cleanTB += excess * 0.5f
                 }
+                
+                val cleanTLuma = (0.299f * cleanTR + 0.587f * cleanTG + 0.114f * cleanTB).coerceAtLeast(1f)
+
+                // 3. Reconstruct final Luma combining clean target and original texture
+                val finalLuma = cleanTLuma + texture
+
+                // 4. Apply Target Chrominance Ratios
+                val idealR = (finalLuma * (cleanTR / cleanTLuma))
+                val idealG = (finalLuma * (cleanTG / cleanTLuma))
+                val idealB = (finalLuma * (cleanTB / cleanTLuma))
+
+                // 5. Final Blend
+                val fR = (oR + (idealR - oR) * a).toInt().coerceIn(0, 255)
+                val fG = (oG + (idealG - oG) * a).toInt().coerceIn(0, 255)
+                val fB = (oB + (idealB - oB) * a).toInt().coerceIn(0, 255)
+
+                val alphaCh = o ushr 24
+                pixels[idx] = (alphaCh shl 24) or (fR shl 16) or (fG shl 8) or fB
             }
         }
 
         if (hits > 0) {
-            val msg = "Commercial Surface Blur: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
+            val msg = "Blemish Final FS: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
             android.util.Log.d("BLEMISH_DEBUG", msg)
             onDebugLog?.invoke(msg)
         }
