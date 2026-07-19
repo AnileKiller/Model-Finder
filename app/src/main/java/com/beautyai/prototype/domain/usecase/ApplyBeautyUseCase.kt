@@ -397,7 +397,7 @@ class ApplyBeautyUseCase {
         // reusing this same contaminated baseline as "what clean skin looks
         // like" is what caused two nearby spots to bleed into each other.
         // Recompute a clean version that skips every already-flagged pixel.
-        val cleanBaseline = maskedBoxBlur(pixels, w, h, localRadius, candidate)
+        val cleanBaseline = maskedBoxBlurDownscaled(pixels, w, h, localRadius, candidate, maxFactor = 4)
 
         // Keep only compact acne-sized connected components.  This is the key
         // guard that rejects broad flushing, nose/cheek shadows and skin-tone
@@ -566,7 +566,7 @@ class ApplyBeautyUseCase {
         // (much larger-radius) baseline can't sample another spot entirely —
         // the same cross-contamination bug as pass 1 had, just worse here
         // since this radius reaches even further (up to 160px).
-        val baseline = maskedBoxBlur(pixels, w, h, localRadius, excludeFromBaseline)
+        val baseline = maskedBoxBlurDownscaled(pixels, w, h, localRadius, excludeFromBaseline, maxFactor = 8)
 
         val out = pixels.copyOf()
         val userStrength = strength.coerceIn(0f, 1f)
@@ -949,6 +949,91 @@ class ApplyBeautyUseCase {
             }
         }
         return out
+    }
+
+    /**
+     * Box-average downscale by an integer factor. Used to shrink the image
+     * before the expensive [maskedBoxBlur] call, since its output is a smooth,
+     * low-frequency "clean skin" estimate — computing it at full resolution
+     * wastes work the eye can't see, and the branch-per-pixel exclusion check
+     * makes it meaningfully heavier than the plain int [gaussianBlur].
+     */
+    private fun downscalePixels(src: IntArray, w: Int, h: Int, factor: Int): Triple<IntArray, Int, Int> {
+        if (factor <= 1) return Triple(src, w, h)
+        val sw = (w + factor - 1) / factor
+        val sh = (h + factor - 1) / factor
+        val out = IntArray(sw * sh)
+        for (sy in 0 until sh) for (sx in 0 until sw) {
+            var rSum = 0; var gSum = 0; var bSum = 0; var cnt = 0
+            val x0 = sx * factor; val y0 = sy * factor
+            for (yy in y0 until minOf(y0 + factor, h)) for (xx in x0 until minOf(x0 + factor, w)) {
+                val p = src[yy * w + xx]
+                rSum += p shr 16 and 0xFF; gSum += p shr 8 and 0xFF; bSum += p and 0xFF; cnt++
+            }
+            out[sy * sw + sx] = if (cnt > 0)
+                0xFF000000.toInt() or ((rSum / cnt) shl 16) or ((gSum / cnt) shl 8) or (bSum / cnt)
+            else 0xFF000000.toInt()
+        }
+        return Triple(out, sw, sh)
+    }
+
+    /** Downscales a BooleanArray conservatively: a cell is excluded if ANY
+     *  pixel inside it was excluded, so shrinking can never let a flagged
+     *  blemish pixel sneak into the baseline average. */
+    private fun downscaleExclude(src: BooleanArray, w: Int, h: Int, factor: Int, sw: Int, sh: Int): BooleanArray {
+        if (factor <= 1) return src
+        val out = BooleanArray(sw * sh)
+        for (sy in 0 until sh) for (sx in 0 until sw) {
+            val x0 = sx * factor; val y0 = sy * factor
+            var any = false
+            outer@ for (yy in y0 until minOf(y0 + factor, h)) for (xx in x0 until minOf(x0 + factor, w)) {
+                if (src[yy * w + xx]) { any = true; break@outer }
+            }
+            out[sy * sw + sx] = any
+        }
+        return out
+    }
+
+    /** Bilinear upscale back to full resolution — smooth by construction, so
+     *  bilinear (rather than nearest) avoids visible blocking in the baseline. */
+    private fun upscalePixels(small: IntArray, sw: Int, sh: Int, w: Int, h: Int, factor: Int): IntArray {
+        if (factor <= 1) return small
+        val out = IntArray(w * h)
+        for (y in 0 until h) {
+            val syF = (y / factor.toFloat()).coerceIn(0f, (sh - 1).toFloat())
+            val sy0 = syF.toInt(); val sy1 = minOf(sy0 + 1, sh - 1); val fy = syF - sy0
+            for (x in 0 until w) {
+                val sxF = (x / factor.toFloat()).coerceIn(0f, (sw - 1).toFloat())
+                val sx0 = sxF.toInt(); val sx1 = minOf(sx0 + 1, sw - 1); val fx = sxF - sx0
+                val p00 = small[sy0 * sw + sx0]; val p10 = small[sy0 * sw + sx1]
+                val p01 = small[sy1 * sw + sx0]; val p11 = small[sy1 * sw + sx1]
+                fun ch(shift: Int): Int {
+                    val c00 = (p00 shr shift) and 0xFF; val c10 = (p10 shr shift) and 0xFF
+                    val c01 = (p01 shr shift) and 0xFF; val c11 = (p11 shr shift) and 0xFF
+                    val top = c00 + (c10 - c00) * fx
+                    val bot = c01 + (c11 - c01) * fx
+                    return (top + (bot - top) * fy).toInt().coerceIn(0, 255)
+                }
+                out[y * w + x] = 0xFF000000.toInt() or (ch(16) shl 16) or (ch(8) shl 8) or ch(0)
+            }
+        }
+        return out
+    }
+
+    /** Runs [maskedBoxBlur] on a downscaled copy and upscales the result,
+     *  instead of paying its per-pixel branch-and-float cost at full
+     *  resolution. `factor` keeps the *downscaled* blur radius around 12px
+     *  regardless of how large `radius` is — so pass 2's 160px baseline costs
+     *  about the same as pass 1's 20px one, rather than scaling up with it. */
+    private fun maskedBoxBlurDownscaled(
+        pixels: IntArray, w: Int, h: Int, radius: Int, exclude: BooleanArray, maxFactor: Int
+    ): IntArray {
+        val factor = (radius / 12).coerceIn(1, maxFactor)
+        if (factor <= 1) return maskedBoxBlur(pixels, w, h, radius, exclude)
+        val (smallPixels, sw, sh) = downscalePixels(pixels, w, h, factor)
+        val smallExclude = downscaleExclude(exclude, w, h, factor, sw, sh)
+        val smallBlurred = maskedBoxBlur(smallPixels, sw, sh, (radius / factor).coerceAtLeast(2), smallExclude)
+        return upscalePixels(smallBlurred, sw, sh, w, h, factor)
     }
 
     /**
