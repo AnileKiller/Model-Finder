@@ -346,7 +346,8 @@ class ApplyBeautyUseCase {
             if (a > 0.02f) { hits++; alphaSum += a }
         }
 
-        val feathered = preBlurMask(alphaMap, w, h, 1)
+        val closed = closeMask(alphaMap, w, h, detailRadius + 1)
+        val feathered = preBlurMask(closed, w, h, 1)
         val out = original.copyOf()
         for (y in 0 until h) for (x in 0 until w) {
             val i = y * w + x
@@ -692,6 +693,46 @@ class ApplyBeautyUseCase {
     private fun multiplyMasks(a: Array<FloatArray>, b: Array<FloatArray>): Array<FloatArray> {
         val h = a.size; val w = if (h > 0) a[0].size else 0
         return Array(h) { y -> FloatArray(w) { x -> a[y][x] * b[y][x] } }
+    }
+
+    /** Morphological closing (dilate then erode) on a float mask. Fills small enclosed
+     *  "holes" — a differently-coloured blob fully surrounded by flagged pixels gets pulled
+     *  up to the surrounding alpha, matching the reference app's core-swap behaviour. */
+    private fun closeMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
+        if (radius <= 0) return mask
+        return erodeMask(dilateMask(mask, w, h, radius), w, h, radius)
+    }
+    
+    private fun dilateMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
+        val tmp = Array(h) { FloatArray(w) }
+        val out = Array(h) { FloatArray(w) }
+        for (y in 0 until h) for (x in 0 until w) {
+            var m = 0f
+            for (k in -radius..radius) m = maxOf(m, mask[y][(x + k).coerceIn(0, w - 1)])
+            tmp[y][x] = m
+        }
+        for (x in 0 until w) for (y in 0 until h) {
+            var m = 0f
+            for (k in -radius..radius) m = maxOf(m, tmp[(y + k).coerceIn(0, h - 1)][x])
+            out[y][x] = m
+        }
+        return out
+    }
+    
+    private fun erodeMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
+        val tmp = Array(h) { FloatArray(w) }
+        val out = Array(h) { FloatArray(w) }
+        for (y in 0 until h) for (x in 0 until w) {
+            var m = 1f
+            for (k in -radius..radius) m = minOf(m, mask[y][(x + k).coerceIn(0, w - 1)])
+            tmp[y][x] = m
+        }
+        for (x in 0 until w) for (y in 0 until h) {
+            var m = 1f
+            for (k in -radius..radius) m = minOf(m, tmp[(y + k).coerceIn(0, h - 1)][x])
+            out[y][x] = m
+        }
+        return out
     }
 
     /**
