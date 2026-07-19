@@ -58,15 +58,20 @@ class ApplyBeautyUseCase {
         // uses redness/contrast detection to avoid eyes and lips naturally.
         val sharpMask = preBlurMask(faceOvalMask, source.width, source.height, 12)
 
-        // Sharpening first — works on original, unmodified detail
+        // Blemishes must be detected on the unsharpened image: sharpening turns pores
+        // and compression texture into false positives. Unlike sharpMask, this mask has
+        // segmentation and feature exclusions, so it is safe around eyes/lips/hair.
+        val blemishMask = preBlurMask(
+            multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 2
+        )
+        if (effective.blemishReduction > 0f)
+            result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
+
         if (effective.faceSharpening > 0f)
             result = applyFaceSharpening(result, faceData, sharpMask, effective.faceSharpening)
 
         if (effective.skinSmoothing > 0f)
             result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
-
-        if (effective.blemishReduction > 0f)
-            result = applyBlemishReduction(result, sharpMask, effective.blemishReduction, onDebugLog)
 
         if (effective.skinBrightness > 0f)
             result = applySkinBrightness(result, smoothMask, effective.skinBrightness)
@@ -278,6 +283,11 @@ class ApplyBeautyUseCase {
         return result
     }
 
+    /**
+     * Local blemish correction.  Detection is relative to the local skin field, never to
+     * absolute RGB/YCbCr "skin" ranges.  This is important: a blue/green colour cast changes
+     * absolute Cb/Cr completely, but a red papule still has a positive local red residual.
+     */
     private fun applyBlemishReduction(
         src: Bitmap,
         mask: Array<FloatArray>,
@@ -285,145 +295,95 @@ class ApplyBeautyUseCase {
         onDebugLog: ((String) -> Unit)? = null
     ): Bitmap {
         val w = src.width; val h = src.height
-        val pixels = IntArray(w * h)
-        src.getPixels(pixels, 0, w, 0, 0, w, h)
+        val original = IntArray(w * h)
+        src.getPixels(original, 0, w, 0, 0, w, h)
 
-        // 1. 3-Tier Blurs (Size Gate protection for Lips/Features)
-        val narrowRadius = (w * 0.002f).toInt().coerceIn(1, 4)
-        val midRadius = (w * 0.020f).toInt().coerceIn(10, 32)
-        val wideRadius = (w * 0.045f).toInt().coerceIn(20, 64)
+        // Scale from the actual masked face, rather than from the export width.  This keeps
+        // the same physical blemish limit when an image is resized before processing.
+        var facePixels = 0
+        for (y in 0 until h) for (x in 0 until w) if (mask[y][x] > 0.50f) facePixels++
+        val faceScale = sqrt(facePixels.toFloat()).coerceAtLeast(80f)
+        val detailRadius = (faceScale * 0.006f).toInt().coerceIn(1, 3)
+        val localRadius = (faceScale * 0.028f).toInt().coerceIn(4, 14)
+        val sizeRadius = (faceScale * 0.055f).toInt().coerceIn(8, 24)
 
-        val narrow = gaussianBlur(pixels, w, h, narrowRadius)
-        val mid = gaussianBlur(pixels, w, h, midRadius)
-        val wide = gaussianBlur(pixels, w, h, wideRadius)
-
+        // gaussianApprox is three box passes: substantially closer to a Gaussian than the
+        // former single box pass, while retaining predictable Android-only performance.
+        val detail = gaussianApprox(original, w, h, detailRadius)
+        val local = gaussianApprox(original, w, h, localRadius)
+        val size = gaussianApprox(original, w, h, sizeRadius)
         val alphaMap = Array(h) { FloatArray(w) }
-        val globalIntensity = strength.coerceIn(0f, 1f)
-        val maxAlpha = 0.95f 
-        
-        var hits = 0
-        var alphaSum = 0f
+        var hits = 0; var alphaSum = 0f
 
-        // ── PASS 1: Build the Alpha Map via YCbCr & Mole Ratio ────────────
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val maskVal = mask[y][x]
-                if (maskVal < 0.05f) continue
+        for (y in 0 until h) for (x in 0 until w) {
+            val maskValue = mask[y][x]
+            if (maskValue < 0.05f) continue
+            val i = y * w + x
+            val o = original[i]; val b = local[i]; val m = size[i]
+            val r = o shr 16 and 255; val g = o shr 8 and 255; val bl = o and 255
+            val br = b shr 16 and 255; val bg = b shr 8 and 255; val bb = b and 255
+            val mr = m shr 16 and 255; val mg = m shr 8 and 255
 
-                val idx = y * w + x
-                val n = narrow[idx]; val m = mid[idx]; val t = wide[idx]
+            // Relative redness survives a global colour cast. Yellow also has a positive
+            // residual; green does not, which matches the supplied colour-marker experiment.
+            val redResidual = (r - g - (br - bg)).toFloat()
+            val localY = 0.299f * br + 0.587f * bg + 0.114f * bb
+            val pixelY = 0.299f * r + 0.587f * g + 0.114f * bl
+            val darkResidual = localY - pixelY
 
-                val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
-                val mR = m shr 16 and 0xFF; val mG = m shr 8 and 0xFF
-                val tR = t shr 16 and 0xFF; val tG = t shr 8 and 0xFF; val tB = t and 0xFF
+            val redScore = smoothstep(7f, 28f, redResidual)
+            val darkScore = smoothstep(8f, 24f, darkResidual)
+            // A feature that remains visible at the larger scale is too large to be a spot.
+            val sizeRed = (mr - mg - (br - bg)).toFloat()
+            val persistence = kotlin.math.abs(sizeRed) / kotlin.math.abs(redResidual).coerceAtLeast(2f)
+            val sizeGate = 1f - smoothstep(0.40f, 0.82f, persistence)
 
-                // A. YCbCr Skin Detection (Strict Non-Skin Rejection)
-                val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
-                val cb = 128f - 0.168736f * nR - 0.331264f * nG + 0.5f * nB
-                val cr = 128f + 0.5f * nR - 0.418688f * nG - 0.081312f * nB
-                val isSkin = nLuma > 40f && cb in 77f..135f && cr in 133f..180f
-                
-                if (!isSkin) continue
-
-                // B. Excess Redness Calculation
-                val nRedness = nR - nG
-                val mRedness = mR - mG
-                val tRedness = tR - tG
-                val excessRed = (nRedness - tRedness).toFloat()
-                
-                // C. Mole & Freckle Rejection (Redness-to-Darkness Ratio)
-                val tLuma = 0.299f * tR + 0.587f * tG + 0.114f * tB
-                val lumaDrop = tLuma - nLuma // Positive = darker than surrounding skin
-                
-                val isDarkSpot = lumaDrop > 9f
-                val redPerDark = if (lumaDrop > 1f) excessRed / lumaDrop else 999f
-                
-                // Brown moles are dark but have low relative redness. 
-                if (isDarkSpot && redPerDark < 0.55f) continue
-
-                // D. Size Protection (Lip rejection via mid-blur persistence)
-                val midExcess = (mRedness - tRedness).toFloat()
-                val persistence = midExcess / excessRed.coerceAtLeast(1f)
-                val sizeProtection = 1f - smoothstep(0.75f, 0.98f, persistence)
-
-                // Final Alpha Assembly
-                val rednessAlpha = smoothstep(2f, 12f, excessRed)
-                val lumaAlpha = smoothstep(4f, 15f, lumaDrop)
-
-                var a = maxOf(rednessAlpha, lumaAlpha) * sizeProtection * maskVal * globalIntensity
-                a = a.coerceIn(0f, maxAlpha)
-                
-                alphaMap[y][x] = a
-                if (a > 0.02f) { hits++; alphaSum += a }
-            }
+            // Do not make every dark pore a candidate. Darkness alone needs a modest red
+            // contribution; this preserves moles/freckles and textured facial features.
+            val score = maxOf(redScore, darkScore * (0.20f + 0.80f * redScore))
+            val a = (score * sizeGate * maskValue * strength).coerceIn(0f, 0.72f)
+            alphaMap[y][x] = a
+            if (a > 0.02f) { hits++; alphaSum += a }
         }
 
-        // Feather the alpha map to ensure buttery-smooth patch edges
-        val smoothAlpha = preBlurMask(alphaMap, w, h, 2)
-
-        // ── PASS 2: Luma-Preserving Chrominance Transfer ──────────────────
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val a = smoothAlpha[y][x]
-                if (a <= 0.02f) continue
-
-                val idx = y * w + x
-                val o = pixels[idx]
-                val n = narrow[idx]
-                val t = wide[idx]
-
-                val oR = o shr 16 and 0xFF; val oG = o shr 8 and 0xFF; val oB = o and 0xFF
-                val nR = n shr 16 and 0xFF; val nG = n shr 8 and 0xFF; val nB = n and 0xFF
-                val tR = t shr 16 and 0xFF; val tG = t shr 8 and 0xFF; val tB = t and 0xFF
-
-                // 1. Calculate high-frequency texture (Luminance detail)
-                val oLuma = 0.299f * oR + 0.587f * oG + 0.114f * oB
-                val nLuma = 0.299f * nR + 0.587f * nG + 0.114f * nB
-                val texture = oLuma - nLuma
-
-                // 2. Clean the Target Color (Crucial for dense, severe acne patches)
-                var cleanTR = tR.toFloat()
-                var cleanTG = tG.toFloat()
-                var cleanTB = tB.toFloat()
-                
-                val targetRedness = cleanTR - cleanTG
-                
-                // This block specifically prevents the "jawline bruise"
-                if (targetRedness > 35f) {
-                    val excess = (targetRedness - 35f) * 0.5f 
-                    cleanTR -= excess
-                    cleanTG += excess * 0.5f
-                    cleanTB += excess * 0.5f
-                }
-                
-                val cleanTLuma = (0.299f * cleanTR + 0.587f * cleanTG + 0.114f * cleanTB).coerceAtLeast(1f)
-
-                // 3. Reconstruct final Luma combining clean target and original texture
-                val finalLuma = cleanTLuma + texture
-
-                // 4. Apply Target Chrominance Ratios
-                val idealR = (finalLuma * (cleanTR / cleanTLuma))
-                val idealG = (finalLuma * (cleanTG / cleanTLuma))
-                val idealB = (finalLuma * (cleanTB / cleanTLuma))
-
-                // 5. Final Blend
-                val fR = (oR + (idealR - oR) * a).toInt().coerceIn(0, 255)
-                val fG = (oG + (idealG - oG) * a).toInt().coerceIn(0, 255)
-                val fB = (oB + (idealB - oB) * a).toInt().coerceIn(0, 255)
-
-                val alphaCh = o ushr 24
-                pixels[idx] = (alphaCh shl 24) or (fR shl 16) or (fG shl 8) or fB
-            }
+        val feathered = preBlurMask(alphaMap, w, h, 1)
+        val out = original.copyOf()
+        for (y in 0 until h) for (x in 0 until w) {
+            val i = y * w + x
+            // Reapply the safe mask after feathering; this prevents alpha from leaking onto
+            // lips, eyes and the face boundary.
+            val a = (feathered[y][x] * mask[y][x]).coerceIn(0f, 0.72f)
+            if (a <= 0.02f) continue
+            val o = original[i]; val d = detail[i]; val target = local[i]
+            val or = o shr 16 and 255; val og = o shr 8 and 255; val ob = o and 255
+            val dr = d shr 16 and 255; val dg = d shr 8 and 255; val db = d and 255
+            var tr = (target shr 16 and 255).toFloat()
+            var tg = (target shr 8 and 255).toFloat()
+            var tb = (target and 255).toFloat()
+            val y0 = 0.299f * or + 0.587f * og + 0.114f * ob
+            val yd = 0.299f * dr + 0.587f * dg + 0.114f * db
+            val yt = (0.299f * tr + 0.587f * tg + 0.114f * tb).coerceAtLeast(1f)
+            // Restore only fine luminance texture.  The local target supplies chroma, which
+            // produces the observed red-to-blue / blue-to-red local inpainting signature.
+            val desiredY = (yt + (y0 - yd) * 0.30f).coerceAtLeast(1f)
+            val gain = desiredY / yt; tr *= gain; tg *= gain; tb *= gain
+            val nr = (or + (tr - or) * a).toInt().coerceIn(0,255)
+            val ng = (og + (tg - og) * a).toInt().coerceIn(0,255)
+            val nb = (ob + (tb - ob) * a).toInt().coerceIn(0,255)
+            out[i] = (o and -0x1000000) or (nr shl 16) or (ng shl 8) or nb
         }
-
-        if (hits > 0) {
-            val msg = "Blemish Final FS: %d px corrected, mean alpha %.2f".format(hits, alphaSum / hits)
-            android.util.Log.d("BLEMISH_DEBUG", msg)
-            onDebugLog?.invoke(msg)
-        }
-
-        src.setPixels(pixels, 0, w, 0, 0, w, h)
+        src.setPixels(out, 0, w, 0, 0, w, h)
+        if (hits > 0) onDebugLog?.invoke(
+            "Blemish local: $hits px, mean alpha %.2f, radii $detailRadius/$localRadius/$sizeRadius".format(alphaSum / hits)
+        )
         return src
+    }
+
+    /** Three separable box passes approximate a Gaussian; gaussianBlur itself is one box pass. */
+    private fun gaussianApprox(src: IntArray, w: Int, h: Int, radius: Int): IntArray {
+        var result = src
+        repeat(3) { result = gaussianBlur(result, w, h, radius) }
+        return result
     }
 
 
