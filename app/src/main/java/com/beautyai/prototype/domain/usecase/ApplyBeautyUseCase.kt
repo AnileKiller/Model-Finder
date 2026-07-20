@@ -284,9 +284,17 @@ class ApplyBeautyUseCase {
     }
 
     /**
-     * Local blemish correction.  Detection is relative to the local skin field, never to
-     * absolute RGB/YCbCr "skin" ranges.  This is important: a blue/green colour cast changes
-     * absolute Cb/Cr completely, but a red papule still has a positive local red residual.
+     * Local blemish correction.
+     *
+     * BeautyEditor's blemish pass behaves less like ordinary skin smoothing and more like
+     * small local inpainting:
+     * - detection is relative to the nearby colour field, so a blue-tinted face still works;
+     * - red/yellow/blue chroma outliers are eligible, green-dominant marks are mostly ignored;
+     * - replacement comes from an annulus around the pixel rather than from a same-pixel blur.
+     *
+     * That annular target is the important bit for the synthetic test: a blue centre inside a
+     * red ring is replaced by red from its surrounding ring, while the ring itself is pulled
+     * toward the surrounding blue skin, producing the observed colour-swap signature.
      */
     private fun applyBlemishReduction(
         src: Bitmap,
@@ -298,86 +306,152 @@ class ApplyBeautyUseCase {
         val original = IntArray(w * h)
         src.getPixels(original, 0, w, 0, 0, w, h)
 
-        // Scale from the actual masked face, rather than from the export width.  This keeps
-        // the same physical blemish limit when an image is resized before processing.
+        // Scale radii from the actual face-mask area so resizing the input does not change
+        // the physical blemish size that gets treated.
         var facePixels = 0
         for (y in 0 until h) for (x in 0 until w) if (mask[y][x] > 0.50f) facePixels++
         val faceScale = sqrt(facePixels.toFloat()).coerceAtLeast(80f)
-        val detailRadius = (faceScale * 0.006f).toInt().coerceIn(1, 3)
-        val localRadius = (faceScale * 0.028f).toInt().coerceIn(4, 14)
-        val sizeRadius = (faceScale * 0.055f).toInt().coerceIn(8, 24)
 
-        // gaussianApprox is three box passes: substantially closer to a Gaussian than the
-        // former single box pass, while retaining predictable Android-only performance.
+        val detailRadius = (faceScale * 0.006f).toInt().coerceIn(1, 3)
+        val localRadius  = (faceScale * 0.028f).toInt().coerceIn(4, 14)
+        val sizeRadius   = (faceScale * 0.055f).toInt().coerceIn(8, 24)
+
+        // Inner/outer radii for the inpaint source band. On the supplied 1080px export this
+        // lands around 7/16 px, which matches the commercial app's red↔blue centre swap.
+        val annulusInnerRadius = (faceScale * 0.018f).toInt().coerceIn(3, 8)
+        val annulusOuterRadius = (faceScale * 0.040f).toInt().coerceIn(9, 18)
+            .coerceAtLeast(annulusInnerRadius + 2)
+
         val detail = gaussianApprox(original, w, h, detailRadius)
-        val local = gaussianApprox(original, w, h, localRadius)
-        val size = gaussianApprox(original, w, h, sizeRadius)
+        val local  = gaussianApprox(original, w, h, localRadius)
+        val size   = gaussianApprox(original, w, h, sizeRadius)
+        val inpaintTarget = annularBlur(original, w, h, annulusInnerRadius, annulusOuterRadius)
+
         val alphaMap = Array(h) { FloatArray(w) }
         var hits = 0; var alphaSum = 0f
 
         for (y in 0 until h) for (x in 0 until w) {
             val maskValue = mask[y][x]
             if (maskValue < 0.05f) continue
+
             val i = y * w + x
             val o = original[i]; val b = local[i]; val m = size[i]
             val r = o shr 16 and 255; val g = o shr 8 and 255; val bl = o and 255
             val br = b shr 16 and 255; val bg = b shr 8 and 255; val bb = b and 255
-            val mr = m shr 16 and 255; val mg = m shr 8 and 255
+            val mr = m shr 16 and 255; val mg = m shr 8 and 255; val mb = m and 255
 
-            // Relative redness survives a global colour cast. Yellow also has a positive
-            // residual; green does not, which matches the supplied colour-marker experiment.
+            // Local chroma residuals. These are deliberately relative to the nearby face
+            // colour, not absolute skin RGB/YCrCb ranges, so a global colour cast is OK.
             val redResidual = (r - g - (br - bg)).toFloat()
+            val blueResidual = ((bl - maxOf(r, g)) - (bb - maxOf(br, bg))).toFloat()
+            val yellowResidual = (((r + g) * 0.5f - bl) - ((br + bg) * 0.5f - bb))
+            val greenResidual = ((g - maxOf(r, bl)) - (bg - maxOf(br, bb))).toFloat()
+
             val localY = 0.299f * br + 0.587f * bg + 0.114f * bb
             val pixelY = 0.299f * r + 0.587f * g + 0.114f * bl
             val darkResidual = localY - pixelY
 
-            val redScore = smoothstep(7f, 28f, redResidual)
-            val darkScore = smoothstep(8f, 24f, darkResidual)
-            // A feature that remains visible at the larger scale is too large to be a spot.
-            val sizeRed = (mr - mg - (br - bg)).toFloat()
-            val persistence = kotlin.math.abs(sizeRed) / kotlin.math.abs(redResidual).coerceAtLeast(2f)
-            val sizeGate = 1f - smoothstep(0.40f, 0.82f, persistence)
+            val chromaDistance = sqrt(
+                ((r - br) * (r - br) + (g - bg) * (g - bg) + (bl - bb) * (bl - bb)).toFloat()
+            )
 
-            // Do not make every dark pore a candidate. Darkness alone needs a modest red
-            // contribution; this preserves moles/freckles and textured facial features.
-            val score = maxOf(redScore, darkScore * (0.20f + 0.80f * redScore))
-            val a = (score * sizeGate * maskValue * strength).coerceIn(0f, 0.72f)
+            val redScore = smoothstep(7f, 28f, redResidual)
+            val blueScore = smoothstep(18f, 50f, blueResidual) * smoothstep(28f, 70f, chromaDistance)
+            val yellowScore = smoothstep(18f, 50f, yellowResidual) * smoothstep(28f, 70f, chromaDistance)
+            val greenScore = smoothstep(14f, 40f, greenResidual)
+            val darkScore = smoothstep(8f, 24f, darkResidual)
+
+            // Large features persist at the broader scale. Small blemishes do not.
+            val sizeRedResidual = (mr - mg - (br - bg)).toFloat()
+            val sizeBlueResidual = ((mb - maxOf(mr, mg)) - (bb - maxOf(br, bg))).toFloat()
+            val sizeYellowResidual = (((mr + mg) * 0.5f - mb) - ((br + bg) * 0.5f - bb))
+            val residualMagnitude = maxOf(
+                kotlin.math.abs(redResidual),
+                kotlin.math.abs(blueResidual),
+                kotlin.math.abs(yellowResidual),
+                darkResidual.coerceAtLeast(0f),
+                2f
+            )
+            val persistentMagnitude = maxOf(
+                kotlin.math.abs(sizeRedResidual),
+                kotlin.math.abs(sizeBlueResidual),
+                kotlin.math.abs(sizeYellowResidual)
+            )
+            val persistence = persistentMagnitude / residualMagnitude
+            val sizeGate = 1f - smoothstep(0.42f, 0.86f, persistence)
+
+            // Darkness alone is not enough; it needs some red/yellow/blue abnormality so pores,
+            // freckles, moles and facial edges do not get washed out.
+            val chromaScore = maxOf(redScore, blueScore, yellowScore)
+            val score = maxOf(chromaScore, darkScore * (0.20f + 0.80f * chromaScore))
+            val a = (score * (1f - greenScore) * sizeGate * maskValue * strength)
+                .coerceIn(0f, BLEMISH_MAX_ALPHA)
+
             alphaMap[y][x] = a
             if (a > 0.02f) { hits++; alphaSum += a }
         }
 
-        val closed = closeMask(alphaMap, w, h, sizeRadius)
-        val feathered = preBlurMask(closed, w, h, 1)
+        val feathered = preBlurMask(alphaMap, w, h, 1)
         val out = original.copyOf()
         for (y in 0 until h) for (x in 0 until w) {
             val i = y * w + x
-            // Reapply the safe mask after feathering; this prevents alpha from leaking onto
-            // lips, eyes and the face boundary.
-            val a = (feathered[y][x] * mask[y][x]).coerceIn(0f, 0.72f)
+            val a = (feathered[y][x] * mask[y][x]).coerceIn(0f, BLEMISH_MAX_ALPHA)
             if (a <= 0.02f) continue
-            val o = original[i]; val d = detail[i]; val target = local[i]
+
+            val o = original[i]
+            val d = detail[i]
+            val target = inpaintTarget[i]
+
             val or = o shr 16 and 255; val og = o shr 8 and 255; val ob = o and 255
             val dr = d shr 16 and 255; val dg = d shr 8 and 255; val db = d and 255
             var tr = (target shr 16 and 255).toFloat()
             var tg = (target shr 8 and 255).toFloat()
             var tb = (target and 255).toFloat()
+
+            // Preserve only a little fine luminance texture; chroma comes from the annular
+            // inpaint target. This keeps skin from becoming flat while matching the marker test.
             val y0 = 0.299f * or + 0.587f * og + 0.114f * ob
             val yd = 0.299f * dr + 0.587f * dg + 0.114f * db
             val yt = (0.299f * tr + 0.587f * tg + 0.114f * tb).coerceAtLeast(1f)
-            // Restore only fine luminance texture.  The local target supplies chroma, which
-            // produces the observed red-to-blue / blue-to-red local inpainting signature.
-            val desiredY = (yt + (y0 - yd) * 0.30f).coerceAtLeast(1f)
-            val gain = desiredY / yt; tr *= gain; tg *= gain; tb *= gain
-            val nr = (or + (tr - or) * a).toInt().coerceIn(0,255)
-            val ng = (og + (tg - og) * a).toInt().coerceIn(0,255)
-            val nb = (ob + (tb - ob) * a).toInt().coerceIn(0,255)
+            val desiredY = (yt + (y0 - yd) * 0.18f).coerceAtLeast(1f)
+            val gain = desiredY / yt
+            tr *= gain; tg *= gain; tb *= gain
+
+            val nr = (or + (tr - or) * a).toInt().coerceIn(0, 255)
+            val ng = (og + (tg - og) * a).toInt().coerceIn(0, 255)
+            val nb = (ob + (tb - ob) * a).toInt().coerceIn(0, 255)
             out[i] = (o and -0x1000000) or (nr shl 16) or (ng shl 8) or nb
         }
+
         src.setPixels(out, 0, w, 0, 0, w, h)
         if (hits > 0) onDebugLog?.invoke(
-            "Blemish local: $hits px, mean alpha %.2f, radii $detailRadius/$localRadius/$sizeRadius".format(alphaSum / hits)
+            "Blemish local: $hits px, mean alpha %.2f, radii detail/local/size $detailRadius/$localRadius/$sizeRadius, annulus $annulusInnerRadius/$annulusOuterRadius"
+                .format(alphaSum / hits)
         )
         return src
+    }
+
+    /**
+     * Fast annular colour average: box blur at [outerRadius] minus box blur at [innerRadius].
+     * This approximates sampling the immediate surroundings of a blemish instead of averaging
+     * the blemish pixel into its own replacement colour.
+     */
+    private fun annularBlur(src: IntArray, w: Int, h: Int, innerRadius: Int, outerRadius: Int): IntArray {
+        val inner = gaussianBlur(src, w, h, innerRadius)
+        val outer = gaussianBlur(src, w, h, outerRadius)
+        val innerArea = (2 * innerRadius + 1) * (2 * innerRadius + 1)
+        val outerArea = (2 * outerRadius + 1) * (2 * outerRadius + 1)
+        val ringArea = (outerArea - innerArea).coerceAtLeast(1)
+        val out = IntArray(w * h)
+
+        for (i in src.indices) {
+            val op = outer[i]; val ip = inner[i]
+            val r = (((op shr 16 and 255) * outerArea - (ip shr 16 and 255) * innerArea) / ringArea).coerceIn(0, 255)
+            val g = (((op shr 8 and 255) * outerArea - (ip shr 8 and 255) * innerArea) / ringArea).coerceIn(0, 255)
+            val b = (((op and 255) * outerArea - (ip and 255) * innerArea) / ringArea).coerceIn(0, 255)
+            out[i] = (src[i] and -0x1000000) or (r shl 16) or (g shl 8) or b
+        }
+        return out
     }
 
     /** Three separable box passes approximate a Gaussian; gaussianBlur itself is one box pass. */
@@ -693,46 +767,6 @@ class ApplyBeautyUseCase {
     private fun multiplyMasks(a: Array<FloatArray>, b: Array<FloatArray>): Array<FloatArray> {
         val h = a.size; val w = if (h > 0) a[0].size else 0
         return Array(h) { y -> FloatArray(w) { x -> a[y][x] * b[y][x] } }
-    }
-
-    /** Morphological closing (dilate then erode) on a float mask. Fills small enclosed
-     *  "holes" — a differently-coloured blob fully surrounded by flagged pixels gets pulled
-     *  up to the surrounding alpha, matching the reference app's core-swap behaviour. */
-    private fun closeMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
-        if (radius <= 0) return mask
-        return erodeMask(dilateMask(mask, w, h, radius), w, h, radius)
-    }
-    
-    private fun dilateMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
-        val tmp = Array(h) { FloatArray(w) }
-        val out = Array(h) { FloatArray(w) }
-        for (y in 0 until h) for (x in 0 until w) {
-            var m = 0f
-            for (k in -radius..radius) m = maxOf(m, mask[y][(x + k).coerceIn(0, w - 1)])
-            tmp[y][x] = m
-        }
-        for (x in 0 until w) for (y in 0 until h) {
-            var m = 0f
-            for (k in -radius..radius) m = maxOf(m, tmp[(y + k).coerceIn(0, h - 1)][x])
-            out[y][x] = m
-        }
-        return out
-    }
-    
-    private fun erodeMask(mask: Array<FloatArray>, w: Int, h: Int, radius: Int): Array<FloatArray> {
-        val tmp = Array(h) { FloatArray(w) }
-        val out = Array(h) { FloatArray(w) }
-        for (y in 0 until h) for (x in 0 until w) {
-            var m = 1f
-            for (k in -radius..radius) m = minOf(m, mask[y][(x + k).coerceIn(0, w - 1)])
-            tmp[y][x] = m
-        }
-        for (x in 0 until w) for (y in 0 until h) {
-            var m = 1f
-            for (k in -radius..radius) m = minOf(m, tmp[(y + k).coerceIn(0, h - 1)][x])
-            out[y][x] = m
-        }
-        return out
     }
 
     /**
@@ -1268,6 +1302,7 @@ class ApplyBeautyUseCase {
 
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.2f
+        private const val BLEMISH_MAX_ALPHA         = 0.94f
         private const val MAX_BILATERAL_RADIUS      = 6       
         private const val BILATERAL_SPATIAL_SIGMA   = 3f       
         private const val BILATERAL_COLOR_SIGMA     = 30f      
