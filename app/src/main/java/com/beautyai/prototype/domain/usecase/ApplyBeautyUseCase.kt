@@ -284,20 +284,20 @@ class ApplyBeautyUseCase {
     }
 
     /**
-     * Adaptive local blemish correction.
+     * Commercial-style blemish reduction.
      *
-     * This pass is intentionally separate from skin smoothing: it detects small local colour
-     * outliers, grows the correction only over compact marks, then pulls those pixels toward
-     * a nearby annular skin sample while preserving a little luminance texture.
+     * The earlier version could soften the loudest centre pixels, but acne clusters still read as
+     * red patches because the replacement colour was averaged from neighbouring pixels that were
+     * often blemished too. This version separates the problem into two cosmetic passes:
      *
-     * Improvements over the previous version:
-     * - stronger multi-scale gating so broad shadows, cheek blush, makeup, and face gradients
-     *   are less likely to be treated as blemishes;
-     * - adaptive red/blue/yellow/dark scoring based on nearby skin rather than absolute RGB;
-     * - a tiny max-filter before feathering so whole pimples/spots are covered, not just the
-     *   mathematically loudest centre pixel;
-     * - safer target limiting, which prevents a saturated spot from being replaced by an
-     *   obviously unrelated neighbouring colour.
+     * 1. high-confidence spot repair for raised pimples, dark marks, scabs, and small colour
+     *    outliers;
+     * 2. lower-alpha diffuse redness calming for acne clusters, so the result looks closer to a
+     *    beauty-editor retouch instead of a simple blur.
+     *
+     * The repair colour is sampled from a clean weighted skin target: pixels already believed to be
+     * blemishes contribute little or nothing to the donor blur. That is the main quality jump over a
+     * plain local/annular blur and prevents red acne regions from re-painting themselves back in.
      */
     private fun applyBlemishReduction(
         src: Bitmap,
@@ -309,25 +309,32 @@ class ApplyBeautyUseCase {
         val original = IntArray(w * h)
         src.getPixels(original, 0, w, 0, 0, w, h)
 
-        // Scale radii from the actual eligible face area so behaviour is stable across exports.
+        // Scale radii from the eligible face area so behaviour is stable across export sizes.
         var facePixels = 0
         for (y in 0 until h) for (x in 0 until w) if (mask[y][x] > 0.50f) facePixels++
         val faceScale = sqrt(facePixels.toFloat()).coerceAtLeast(80f)
 
-        val detailRadius = (faceScale * 0.0055f).toInt().coerceIn(1, 3)
-        val localRadius  = (faceScale * 0.0250f).toInt().coerceIn(4, 13)
-        val broadRadius  = (faceScale * 0.0700f).toInt().coerceIn(10, 30)
-
-        val annulusInnerRadius = (faceScale * 0.017f).toInt().coerceIn(3, 8)
-        val annulusOuterRadius = (faceScale * 0.045f).toInt().coerceIn(10, 22)
-            .coerceAtLeast(annulusInnerRadius + 3)
+        val detailRadius = (faceScale * 0.0045f).toInt().coerceIn(1, 3)
+        val localRadius  = (faceScale * 0.0200f).toInt().coerceIn(4, 12)
+        val broadRadius  = (faceScale * 0.0700f).toInt().coerceIn(12, 34)
+        val donorRadius  = (faceScale * 0.0550f).toInt().coerceIn(12, 30)
+        val clusterDonorRadius = (faceScale * 0.1050f).toInt().coerceIn(22, 52)
+        val growRadius = (faceScale * 0.0060f).toInt().coerceIn(2, 4)
+        val featherRadius = (faceScale * 0.0048f).toInt().coerceIn(2, 4)
 
         val detail = gaussianApprox(original, w, h, detailRadius)
         val local  = gaussianApprox(original, w, h, localRadius)
         val broad  = gaussianApprox(original, w, h, broadRadius)
-        val inpaintTarget = annularBlur(original, w, h, annulusInnerRadius, annulusOuterRadius)
 
-        val alphaMap = Array(h) { FloatArray(w) }
+        val fallbackTarget = annularBlur(
+            original, w, h,
+            (faceScale * 0.018f).toInt().coerceIn(3, 8),
+            donorRadius
+        )
+
+        val repairAlpha = Array(h) { FloatArray(w) }
+        val calmAlpha = Array(h) { FloatArray(w) }
+        val donorRejectAlpha = Array(h) { FloatArray(w) }
         var hits = 0
         var alphaSum = 0f
 
@@ -348,7 +355,7 @@ class ApplyBeautyUseCase {
             val localY = 0.299f * lr + 0.587f * lg + 0.114f * lb
             val broadY = 0.299f * br + 0.587f * bg + 0.114f * bb
 
-            // Local chroma residuals. Relative scoring keeps the detector usable under colour casts.
+            // Relative chroma residuals: robust under warm/cool lighting and camera colour casts.
             val redResidual = (r - g - (lr - lg)).toFloat()
             val blueResidual = ((bl - maxOf(r, g)) - (lb - maxOf(lr, lg))).toFloat()
             val yellowResidual = (((r + g) * 0.5f - bl) - ((lr + lg) * 0.5f - lb))
@@ -361,96 +368,130 @@ class ApplyBeautyUseCase {
             )
             val yDistance = kotlin.math.abs(pixelY - localY)
 
-            // Main blemish likelihood. Red gets the lowest threshold; yellow needs more evidence.
-            val redScore = smoothstep(4f, 20f, redResidual) * smoothstep(8f, 34f, chromaDistance)
-            val blueScore = smoothstep(10f, 36f, blueResidual) * smoothstep(20f, 62f, chromaDistance)
-            val yellowScore = smoothstep(24f, 72f, yellowResidual) * smoothstep(42f, 100f, chromaDistance) * 0.38f
+            val redSpotScore = smoothstep(3f, 16f, redResidual) * smoothstep(6f, 28f, chromaDistance)
+            val blueScore = smoothstep(10f, 34f, blueResidual) * smoothstep(16f, 56f, chromaDistance)
+            val yellowScore = smoothstep(22f, 72f, yellowResidual) * smoothstep(36f, 96f, chromaDistance) * 0.34f
             val greenReject = smoothstep(8f, 30f, greenResidual)
 
-            // Dark acne/scabs should be eligible, but ordinary pores, freckles, lash shadows, and
-            // face contours should not be erased by darkness alone.
-            val chromaOutlier = maxOf(redScore, blueScore, yellowScore)
-            val darkScore = smoothstep(7f, 26f, darkResidual) * smoothstep(10f, 46f, chromaDistance)
-            val lightScore = smoothstep(18f, 54f, lightResidual) * chromaOutlier * 0.25f
+            val chromaOutlier = maxOf(redSpotScore, blueScore, yellowScore)
+            val darkScore = smoothstep(7f, 28f, darkResidual) * smoothstep(8f, 44f, maxOf(chromaDistance, yDistance))
+            val lightScore = smoothstep(18f, 56f, lightResidual) * chromaOutlier * 0.22f
 
-            // Small blemishes differ from the local skin but disappear at broad scale. Broad colour
-            // fields, shadows, blush, beard tone, and makeup stay persistent and are protected.
+            // Protect stable facial gradients and broad shadows, but do not completely protect acne
+            // clusters: commercial blemish tools reduce red patchiness, not just isolated pimples.
             val broadRedResidual = (br - bg - (lr - lg)).toFloat()
             val broadBlueResidual = ((bb - maxOf(br, bg)) - (lb - maxOf(lr, lg))).toFloat()
             val broadYellowResidual = (((br + bg) * 0.5f - bb) - ((lr + lg) * 0.5f - lb))
             val residualMagnitude = maxOf(
-                kotlin.math.abs(redResidual),
-                kotlin.math.abs(blueResidual),
-                kotlin.math.abs(yellowResidual),
-                darkResidual.coerceAtLeast(0f),
-                yDistance,
-                2f
+                kotlin.math.abs(redResidual), kotlin.math.abs(blueResidual), kotlin.math.abs(yellowResidual),
+                darkResidual.coerceAtLeast(0f), yDistance, 2f
             )
             val persistentMagnitude = maxOf(
-                kotlin.math.abs(broadRedResidual),
-                kotlin.math.abs(broadBlueResidual),
-                kotlin.math.abs(broadYellowResidual),
-                kotlin.math.abs(broadY - localY)
+                kotlin.math.abs(broadRedResidual), kotlin.math.abs(broadBlueResidual),
+                kotlin.math.abs(broadYellowResidual), kotlin.math.abs(broadY - localY)
             )
-            val sizeGate = 1f - smoothstep(0.50f, 1.05f, persistentMagnitude / residualMagnitude)
+            val compactGate = 1f - smoothstep(0.48f, 1.08f, persistentMagnitude / residualMagnitude)
+            val gradientGate = 1f - smoothstep(14f, 42f, kotlin.math.abs(localY - broadY))
 
-            // Edges and soft gradients are where false positives usually live. This still permits
-            // compact coloured spots, but damps corrections along nostril folds, smile lines, etc.
-            val gradientGate = 1f - smoothstep(12f, 34f, kotlin.math.abs(localY - broadY))
+            // Low-alpha red-cluster calming: lets cystic-acne patches fade like the reference app
+            // while remaining much weaker than true spot replacement.
+            val redClusterScore = smoothstep(3f, 18f, redResidual) *
+                (0.40f + 0.60f * smoothstep(6f, 34f, chromaDistance)) *
+                (1f - smoothstep(56f, 108f, kotlin.math.abs(localY - broadY)))
 
-            val score = maxOf(chromaOutlier * 1.18f, darkScore * (0.35f + 0.65f * chromaOutlier), lightScore)
-            val a = (score * (1f - greenReject) * sizeGate * gradientGate * maskValue * strength * 1.22f)
-                .coerceIn(0f, BLEMISH_MAX_ALPHA)
+            val spotScore = maxOf(
+                redSpotScore * 1.65f * (0.50f + 0.50f * compactGate),
+                blueScore * compactGate,
+                yellowScore * compactGate,
+                darkScore * (0.40f + 0.60f * chromaOutlier) * compactGate,
+                lightScore * compactGate
+            )
 
-            alphaMap[y][x] = a
-            if (a > 0.02f) { hits++; alphaSum += a }
+            val reject = (1f - greenReject) * gradientGate
+            val repair = (spotScore * reject * maskValue * strength * 1.78f).coerceIn(0f, BLEMISH_MAX_ALPHA)
+            val calm = (redClusterScore * reject * maskValue * strength * BLEMISH_DIFFUSE_REDNESS_ALPHA * 1.18f)
+                .coerceIn(0f, BLEMISH_DIFFUSE_REDNESS_ALPHA)
+
+            repairAlpha[y][x] = repair
+            calmAlpha[y][x] = calm
+            donorRejectAlpha[y][x] = maxOf(
+                spotScore * reject * maskValue,
+                redClusterScore * reject * maskValue * 0.92f
+            ).coerceIn(0f, 1f)
+            val effectiveA = maxOf(repair, calm * 0.65f)
+            if (effectiveA > 0.02f) { hits++; alphaSum += effectiveA }
         }
 
-        // Grow by one pixel before feathering so the correction covers the full visible mark.
-        val grown = maxFilterMask(alphaMap, w, h, 1)
-        val feathered = preBlurMask(grown, w, h, 1)
-        val out = original.copyOf()
+        // Grow and feather separately: spot repair gets fuller coverage; diffuse redness stays softer.
+        val grownRepair = maxFilterMask(repairAlpha, w, h, growRadius)
+        val featheredRepair = preBlurMask(grownRepair, w, h, featherRadius)
+        val featheredCalm = preBlurMask(maxFilterMask(calmAlpha, w, h, 1), w, h, featherRadius + 1)
+        val donorReject = preBlurMask(maxFilterMask(donorRejectAlpha, w, h, growRadius + 1), w, h, featherRadius + 1)
 
+        // Build clean donor weights from the grown confidence map. Suspected blemishes are largely
+        // removed from the donor blur, so clustered acne samples surrounding normal skin instead of
+        // averaging red marks into the replacement colour.
+        val cleanWeight = FloatArray(w * h)
+        for (y in 0 until h) for (x in 0 until w) {
+            // Use detection confidence, not just final output alpha, to keep red acne clusters
+            // out of the donor pool. Otherwise wide red patches average themselves back in.
+            val diffuseSuspect = (featheredCalm[y][x] / BLEMISH_DIFFUSE_REDNESS_ALPHA).coerceIn(0f, 1f)
+            val suspect = maxOf(grownRepair[y][x], donorReject[y][x], diffuseSuspect).coerceIn(0f, 1f)
+            val skin = mask[y][x].coerceIn(0f, 1f)
+            cleanWeight[y * w + x] = skin * (1f - suspect) * (1f - suspect) * (1f - suspect * 0.35f)
+        }
+        val cleanTarget = cleanWeightedBlurTarget(original, cleanWeight, fallbackTarget, w, h, donorRadius)
+        val clusterTarget = cleanWeightedBlurTarget(original, cleanWeight, cleanTarget, w, h, clusterDonorRadius)
+
+        val out = original.copyOf()
         for (y in 0 until h) for (x in 0 until w) {
             val i = y * w + x
-            val a = (feathered[y][x] * mask[y][x]).coerceIn(0f, BLEMISH_MAX_ALPHA)
-            if (a <= 0.02f) continue
+            val repairA = (featheredRepair[y][x] * mask[y][x]).coerceIn(0f, BLEMISH_MAX_ALPHA)
+            val calmA = (featheredCalm[y][x] * mask[y][x]).coerceIn(0f, BLEMISH_DIFFUSE_REDNESS_ALPHA)
+            if (repairA <= 0.015f && calmA <= 0.015f) continue
 
             val o = original[i]
             val d = detail[i]
-            val target = inpaintTarget[i]
-
             val or = o shr 16 and 255; val og = o shr 8 and 255; val ob = o and 255
             val dr = d shr 16 and 255; val dg = d shr 8 and 255; val db = d and 255
-            var tr = (target shr 16 and 255).toFloat()
-            var tg = (target shr 8 and 255).toFloat()
-            var tb = (target and 255).toFloat()
 
-            // Prevent the annulus from dragging the repair toward a wildly different nearby feature.
-            val maxDelta = 58f + 34f * strength
+            val compactTarget = cleanTarget[i]
+            val wideTarget = clusterTarget[i]
+            val wideMix = smoothstep(0.10f, 0.52f, maxOf(repairA, calmA * 1.65f))
+            var tr = ((compactTarget shr 16 and 255) + ((wideTarget shr 16 and 255) - (compactTarget shr 16 and 255)) * wideMix)
+            var tg = ((compactTarget shr 8 and 255) + ((wideTarget shr 8 and 255) - (compactTarget shr 8 and 255)) * wideMix)
+            var tb = ((compactTarget and 255) + ((wideTarget and 255) - (compactTarget and 255)) * wideMix)
+
+            // Prevent donor colour from crossing into unrelated nearby features or heavy lighting changes.
+            val maxDelta = 72f + 50f * strength
             tr = or + (tr - or).coerceIn(-maxDelta, maxDelta)
             tg = og + (tg - og).coerceIn(-maxDelta, maxDelta)
             tb = ob + (tb - ob).coerceIn(-maxDelta, maxDelta)
 
-            // Chroma comes from the surrounding skin, but keep a touch of fine luminance texture.
             val y0 = 0.299f * or + 0.587f * og + 0.114f * ob
             val yd = 0.299f * dr + 0.587f * dg + 0.114f * db
             val yt = (0.299f * tr + 0.587f * tg + 0.114f * tb).coerceAtLeast(1f)
-            val textureKeep = 0.24f * (1f - a * 0.35f)
-            val desiredY = (yt + (y0 - yd) * textureKeep).coerceIn(1f, 255f)
+
+            // Strong repairs may change luminance; diffuse redness calming mostly preserves the
+            // original shade and transfers only cleaner chroma, avoiding a flat airbrushed patch.
+            val totalA = maxOf(repairA, calmA * 0.92f).coerceIn(0f, BLEMISH_MAX_ALPHA)
+            val luminanceReplace = smoothstep(0.08f, 0.62f, repairA)
+            val textureKeep = (0.23f - 0.15f * totalA).coerceIn(0.06f, 0.23f)
+            val repairedY = yt + (y0 - yd) * textureKeep
+            val desiredY = (y0 + (repairedY - y0) * luminanceReplace).coerceIn(1f, 255f)
             val gain = desiredY / yt
             tr *= gain; tg *= gain; tb *= gain
 
-            val nr = (or + (tr - or) * a).toInt().coerceIn(0, 255)
-            val ng = (og + (tg - og) * a).toInt().coerceIn(0, 255)
-            val nb = (ob + (tb - ob) * a).toInt().coerceIn(0, 255)
+            val nr = (or + (tr - or) * totalA).toInt().coerceIn(0, 255)
+            val ng = (og + (tg - og) * totalA).toInt().coerceIn(0, 255)
+            val nb = (ob + (tb - ob) * totalA).toInt().coerceIn(0, 255)
             out[i] = (o and -0x1000000) or (nr shl 16) or (ng shl 8) or nb
         }
 
         val result = src.copy(Bitmap.Config.ARGB_8888, true)
         result.setPixels(out, 0, w, 0, 0, w, h)
         if (hits > 0) onDebugLog?.invoke(
-            "Blemish adaptive: $hits px, mean alpha %.2f, radii detail/local/broad $detailRadius/$localRadius/$broadRadius, annulus $annulusInnerRadius/$annulusOuterRadius"
+            "Blemish commercial: $hits px, mean alpha %.2f, radii detail/local/broad $detailRadius/$localRadius/$broadRadius, donor $donorRadius/$clusterDonorRadius"
                 .format(alphaSum / hits)
         )
         return result
@@ -493,6 +534,79 @@ class ApplyBeautyUseCase {
                     }
                 }
                 out[y][x] = m
+            }
+        }
+        return out
+    }
+
+    /**
+     * Builds a skin-colour donor image by blurring only clean weighted pixels. If the clean weighted
+     * blur has too little support at a pixel, falls back to the supplied target. This is effectively
+     * a cheap, stable inpainting target for beauty retouching.
+     */
+    private fun cleanWeightedBlurTarget(
+        src: IntArray,
+        cleanWeight: FloatArray,
+        fallback: IntArray,
+        w: Int,
+        h: Int,
+        radius: Int
+    ): IntArray {
+        val wr = FloatArray(w * h)
+        val wg = FloatArray(w * h)
+        val wb = FloatArray(w * h)
+        for (i in src.indices) {
+            val weight = cleanWeight[i].coerceIn(0f, 1f)
+            val p = src[i]
+            wr[i] = (p shr 16 and 255) * weight
+            wg[i] = (p shr 8 and 255) * weight
+            wb[i] = (p and 255) * weight
+        }
+
+        val bw = boxBlurFloat(cleanWeight, w, h, radius)
+        val br = boxBlurFloat(wr, w, h, radius)
+        val bg = boxBlurFloat(wg, w, h, radius)
+        val bb = boxBlurFloat(wb, w, h, radius)
+        val out = IntArray(w * h)
+        for (i in src.indices) {
+            val weight = bw[i]
+            if (weight > 0.035f) {
+                val r = (br[i] / weight).toInt().coerceIn(0, 255)
+                val g = (bg[i] / weight).toInt().coerceIn(0, 255)
+                val b = (bb[i] / weight).toInt().coerceIn(0, 255)
+                out[i] = (src[i] and -0x1000000) or (r shl 16) or (g shl 8) or b
+            } else {
+                out[i] = fallback[i]
+            }
+        }
+        return out
+    }
+
+    private fun boxBlurFloat(src: FloatArray, w: Int, h: Int, radius: Int): FloatArray {
+        if (radius <= 0) return src
+        val tmp = FloatArray(w * h)
+        val out = FloatArray(w * h)
+        val div = (2 * radius + 1).toFloat()
+
+        for (y in 0 until h) {
+            var sum = 0f
+            for (k in -radius..radius) sum += src[y * w + k.coerceIn(0, w - 1)]
+            for (x in 0 until w) {
+                tmp[y * w + x] = sum / div
+                val addX = (x + radius + 1).coerceIn(0, w - 1)
+                val subX = (x - radius).coerceIn(0, w - 1)
+                sum += src[y * w + addX] - src[y * w + subX]
+            }
+        }
+
+        for (x in 0 until w) {
+            var sum = 0f
+            for (k in -radius..radius) sum += tmp[k.coerceIn(0, h - 1) * w + x]
+            for (y in 0 until h) {
+                out[y * w + x] = sum / div
+                val addY = (y + radius + 1).coerceIn(0, h - 1)
+                val subY = (y - radius).coerceIn(0, h - 1)
+                sum += tmp[addY * w + x] - tmp[subY * w + x]
             }
         }
         return out
@@ -1347,6 +1461,7 @@ class ApplyBeautyUseCase {
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.2f
         private const val BLEMISH_MAX_ALPHA         = 0.985f
+        private const val BLEMISH_DIFFUSE_REDNESS_ALPHA = 0.58f
         private const val MAX_BILATERAL_RADIUS      = 6       
         private const val BILATERAL_SPATIAL_SIGMA   = 3f       
         private const val BILATERAL_COLOR_SIGMA     = 30f      
