@@ -384,15 +384,40 @@ class ApplyBeautyUseCase {
                 (((highR - highG) * (highR - highG)) + ((highR - highB) * (highR - highB))).toFloat()
             )
 
-            val redSpotScore = smoothstep(4f, 20f, redResidual) * smoothstep(8f, 34f, chromaDistance)
-            val blueScore = smoothstep(10f, 36f, blueResidual) * smoothstep(18f, 60f, chromaDistance)
-            val yellowScore = smoothstep(24f, 76f, yellowResidual) * smoothstep(40f, 100f, chromaDistance) * 0.34f
+            // Tone-adaptive normalisation: residual magnitudes scale with skin brightness, so fixed
+            // thresholds under-detect blemishes on darker skin and over-fire on very bright skin.
+            // Normalising residuals to a reference luminance (~150) keeps sensitivity consistent
+            // across skin tones and exposure levels.
+            val toneScale = (localY / 150f).coerceIn(0.55f, 1.30f)
+            val nRed = redResidual / toneScale
+            val nBlue = blueResidual / toneScale
+            val nYellow = yellowResidual / toneScale
+            val nChroma = chromaDistance / toneScale
+            val nDark = darkResidual / toneScale
+
+            val redSpotScore = smoothstep(4f, 20f, nRed) * smoothstep(8f, 34f, nChroma)
+            val blueScore = smoothstep(10f, 36f, nBlue) * smoothstep(18f, 60f, nChroma)
+            val yellowScore = smoothstep(24f, 76f, nYellow) * smoothstep(40f, 100f, nChroma) * 0.34f
             val greenReject = smoothstep(8f, 30f, greenResidual)
 
-            val chromaOutlier = maxOf(redSpotScore, blueScore, yellowScore)
+            // Specular-highlight protection: bright, low-saturation pixels (nose/forehead shine,
+            // catchlights near the mask edge) must not be classified as "light blemishes" and dulled.
+            val saturation = (maxOf(r, g, bl) - minOf(r, g, bl)).toFloat()
+            val shineReject = smoothstep(196f, 236f, pixelY) * (1f - smoothstep(18f, 48f, saturation))
+
+            // Mid-scale detection: a blemish wider than localRadius bleeds into its own local blur,
+            // so its local residual collapses and it is missed. Comparing the local layer against the
+            // broad layer catches these medium-size marks (large pustules, fresh acne scars).
+            val midRedResidual = ((lr - lg) - (br - bg)).toFloat() / toneScale
+            val midChroma = sqrt(
+                ((lr - br) * (lr - br) + (lg - bg) * (lg - bg) + (lb - bb) * (lb - bb)).toFloat()
+            ) / toneScale
+            val midSpotScore = smoothstep(6f, 22f, midRedResidual) * smoothstep(10f, 38f, midChroma)
+
+            val chromaOutlier = maxOf(redSpotScore, blueScore, yellowScore, midSpotScore * 0.9f)
             val textureOutlier = smoothstep(10f, 42f, highFreqEnergy) * smoothstep(5f, 30f, highFreqChroma)
-            val darkScore = smoothstep(7f, 28f, darkResidual) * smoothstep(8f, 44f, maxOf(chromaDistance, yDistance))
-            val lightScore = smoothstep(18f, 56f, lightResidual) * chromaOutlier * 0.22f
+            val darkScore = smoothstep(7f, 28f, nDark) * smoothstep(8f, 44f, maxOf(nChroma, yDistance / toneScale))
+            val lightScore = smoothstep(18f, 56f, lightResidual) * chromaOutlier * 0.22f * (1f - shineReject)
 
             // Protect stable facial gradients and broad shadows, but do not completely protect acne
             // clusters: commercial blemish tools reduce red patchiness, not just isolated pimples.
@@ -422,13 +447,17 @@ class ApplyBeautyUseCase {
                 yellowScore * compactGate,
                 darkScore * (0.40f + 0.60f * chromaOutlier) * compactGate,
                 lightScore * compactGate,
-                textureOutlier * chromaOutlier * compactGate * 0.72f
+                textureOutlier * chromaOutlier * compactGate * 0.72f,
+                // Medium-size marks are inherently "persistent" vs the broad layer, so they get a
+                // softer compact gate — otherwise the gate that protects shadows also protects them.
+                midSpotScore * 0.85f * (0.35f + 0.65f * compactGate)
             )
 
             // Reject pure texture-only hits: pores, beard shadow, compression, and freckles should not
             // be treated as blemishes unless they also carry a colour/tone outlier signal.
             val pureTextureReject = smoothstep(24f, 58f, highFreqEnergy) * (1f - smoothstep(0.08f, 0.34f, chromaOutlier))
-            val reject = (1f - greenReject) * gradientGate * (1f - pureTextureReject * 0.78f)
+            val reject = (1f - greenReject) * gradientGate * (1f - pureTextureReject * 0.78f) *
+                (1f - shineReject * 0.85f)
             val repair = (spotScore * reject * maskValue * strength * 1.55f).coerceIn(0f, BLEMISH_MAX_ALPHA)
             val calm = (redClusterScore * reject * maskValue * strength * BLEMISH_DIFFUSE_REDNESS_ALPHA)
                 .coerceIn(0f, BLEMISH_DIFFUSE_REDNESS_ALPHA)
