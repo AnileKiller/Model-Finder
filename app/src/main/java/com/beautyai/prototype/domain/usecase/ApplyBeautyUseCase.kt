@@ -358,10 +358,16 @@ class ApplyBeautyUseCase {
             // Tuned from the BeautyAI-vs-BeautyEditor comparison:
             // red/blue synthetic spots were still under-corrected, while yellow was too strong.
             val redScore = smoothstep(5f, 22f, redResidual)
+
             val blueScore = smoothstep(12f, 38f, blueResidual) * smoothstep(22f, 60f, chromaDistance)
             val yellowScore = smoothstep(24f, 68f, yellowResidual) * smoothstep(40f, 90f, chromaDistance) * 0.45f
             val greenScore = smoothstep(10f, 32f, greenResidual)
             val darkScore = smoothstep(8f, 24f, darkResidual)
+            
+            // --- HARD MOLE / BINDI PROTECTION GATE ---
+            // If the pixel is much darker than the baseline, it is a structural mole.
+            val moleProtection = 1f - smoothstep(25f, 45f, darkResidual)
+
 
             // Large features persist at the broader scale. Small blemishes do not.
             val sizeRedResidual = (mr - mg - (br - bg)).toFloat()
@@ -387,10 +393,16 @@ class ApplyBeautyUseCase {
             // Darkness alone is not enough; it needs some red/yellow/blue abnormality so pores,
             // freckles, moles and facial edges do not get washed out.
             val chromaScore = maxOf(redScore, blueScore, yellowScore)
-            val score = maxOf(chromaScore, darkScore * (0.12f + 0.68f * chromaScore))
+            // Calculate score. If it's a mole, score is 0.
+            val score = if (moleProtection <= 0f) {
+                0f // Completely block moles and bindis
+            } else {
+                maxOf(redScore, blueScore, yellowScore, darkScore)
+            }
+
             // Hard cap at 85% to prevent total plastic removal, but ensure it scales to 100%
             val a = (score * (1f - greenScore) * sizeGate * maskValue * strength)
-                .coerceIn(0f, 0.85f)
+              .coerceIn(0f, 0.85f)
 
             alphaMap[y][x] = a
             if (a > 0.02f) { hits++; alphaSum += a }
