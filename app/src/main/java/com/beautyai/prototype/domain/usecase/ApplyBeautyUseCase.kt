@@ -315,12 +315,12 @@ class ApplyBeautyUseCase {
         val faceScale = sqrt(facePixels.toFloat()).coerceAtLeast(80f)
 
         val detailRadius = (faceScale * 0.0045f).toInt().coerceIn(1, 3)
-        val localRadius  = (faceScale * 0.0200f).toInt().coerceIn(4, 12)
-        val broadRadius  = (faceScale * 0.0700f).toInt().coerceIn(12, 34)
-        val donorRadius  = (faceScale * 0.0550f).toInt().coerceIn(12, 30)
-        val clusterDonorRadius = (faceScale * 0.1050f).toInt().coerceIn(22, 52)
-        val growRadius = (faceScale * 0.0060f).toInt().coerceIn(2, 4)
-        val featherRadius = (faceScale * 0.0048f).toInt().coerceIn(2, 4)
+        val localRadius  = (faceScale * 0.0210f).toInt().coerceIn(4, 12)
+        val broadRadius  = (faceScale * 0.0620f).toInt().coerceIn(10, 30)
+        val donorRadius  = (faceScale * 0.0480f).toInt().coerceIn(10, 26)
+        val clusterDonorRadius = (faceScale * 0.0850f).toInt().coerceIn(18, 42)
+        val growRadius = (faceScale * 0.0042f).toInt().coerceIn(1, 3)
+        val featherRadius = (faceScale * 0.0035f).toInt().coerceIn(1, 3)
 
         val detail = gaussianApprox(original, w, h, detailRadius)
         val local  = gaussianApprox(original, w, h, localRadius)
@@ -334,7 +334,6 @@ class ApplyBeautyUseCase {
 
         val repairAlpha = Array(h) { FloatArray(w) }
         val calmAlpha = Array(h) { FloatArray(w) }
-        val donorRejectAlpha = Array(h) { FloatArray(w) }
         var hits = 0
         var alphaSum = 0f
 
@@ -368,9 +367,9 @@ class ApplyBeautyUseCase {
             )
             val yDistance = kotlin.math.abs(pixelY - localY)
 
-            val redSpotScore = smoothstep(3f, 16f, redResidual) * smoothstep(6f, 28f, chromaDistance)
-            val blueScore = smoothstep(10f, 34f, blueResidual) * smoothstep(16f, 56f, chromaDistance)
-            val yellowScore = smoothstep(22f, 72f, yellowResidual) * smoothstep(36f, 96f, chromaDistance) * 0.34f
+            val redSpotScore = smoothstep(4f, 20f, redResidual) * smoothstep(8f, 34f, chromaDistance)
+            val blueScore = smoothstep(10f, 36f, blueResidual) * smoothstep(18f, 60f, chromaDistance)
+            val yellowScore = smoothstep(24f, 76f, yellowResidual) * smoothstep(40f, 100f, chromaDistance) * 0.34f
             val greenReject = smoothstep(8f, 30f, greenResidual)
 
             val chromaOutlier = maxOf(redSpotScore, blueScore, yellowScore)
@@ -395,12 +394,12 @@ class ApplyBeautyUseCase {
 
             // Low-alpha red-cluster calming: lets cystic-acne patches fade like the reference app
             // while remaining much weaker than true spot replacement.
-            val redClusterScore = smoothstep(3f, 18f, redResidual) *
-                (0.40f + 0.60f * smoothstep(6f, 34f, chromaDistance)) *
-                (1f - smoothstep(56f, 108f, kotlin.math.abs(localY - broadY)))
+            val redClusterScore = smoothstep(5f, 22f, redResidual) *
+                (0.45f + 0.55f * smoothstep(8f, 38f, chromaDistance)) *
+                (1f - smoothstep(42f, 86f, kotlin.math.abs(localY - broadY)))
 
             val spotScore = maxOf(
-                redSpotScore * 1.65f * (0.50f + 0.50f * compactGate),
+                redSpotScore * 1.38f * (0.55f + 0.45f * compactGate),
                 blueScore * compactGate,
                 yellowScore * compactGate,
                 darkScore * (0.40f + 0.60f * chromaOutlier) * compactGate,
@@ -408,16 +407,12 @@ class ApplyBeautyUseCase {
             )
 
             val reject = (1f - greenReject) * gradientGate
-            val repair = (spotScore * reject * maskValue * strength * 1.78f).coerceIn(0f, BLEMISH_MAX_ALPHA)
-            val calm = (redClusterScore * reject * maskValue * strength * BLEMISH_DIFFUSE_REDNESS_ALPHA * 1.18f)
+            val repair = (spotScore * reject * maskValue * strength * 1.50f).coerceIn(0f, BLEMISH_MAX_ALPHA)
+            val calm = (redClusterScore * reject * maskValue * strength * BLEMISH_DIFFUSE_REDNESS_ALPHA)
                 .coerceIn(0f, BLEMISH_DIFFUSE_REDNESS_ALPHA)
 
             repairAlpha[y][x] = repair
             calmAlpha[y][x] = calm
-            donorRejectAlpha[y][x] = maxOf(
-                spotScore * reject * maskValue,
-                redClusterScore * reject * maskValue * 0.92f
-            ).coerceIn(0f, 1f)
             val effectiveA = maxOf(repair, calm * 0.65f)
             if (effectiveA > 0.02f) { hits++; alphaSum += effectiveA }
         }
@@ -426,19 +421,15 @@ class ApplyBeautyUseCase {
         val grownRepair = maxFilterMask(repairAlpha, w, h, growRadius)
         val featheredRepair = preBlurMask(grownRepair, w, h, featherRadius)
         val featheredCalm = preBlurMask(maxFilterMask(calmAlpha, w, h, 1), w, h, featherRadius + 1)
-        val donorReject = preBlurMask(maxFilterMask(donorRejectAlpha, w, h, growRadius + 1), w, h, featherRadius + 1)
 
         // Build clean donor weights from the grown confidence map. Suspected blemishes are largely
         // removed from the donor blur, so clustered acne samples surrounding normal skin instead of
         // averaging red marks into the replacement colour.
         val cleanWeight = FloatArray(w * h)
         for (y in 0 until h) for (x in 0 until w) {
-            // Use detection confidence, not just final output alpha, to keep red acne clusters
-            // out of the donor pool. Otherwise wide red patches average themselves back in.
-            val diffuseSuspect = (featheredCalm[y][x] / BLEMISH_DIFFUSE_REDNESS_ALPHA).coerceIn(0f, 1f)
-            val suspect = maxOf(grownRepair[y][x], donorReject[y][x], diffuseSuspect).coerceIn(0f, 1f)
+            val suspect = maxOf(grownRepair[y][x], featheredCalm[y][x]).coerceIn(0f, 1f)
             val skin = mask[y][x].coerceIn(0f, 1f)
-            cleanWeight[y * w + x] = skin * (1f - suspect) * (1f - suspect) * (1f - suspect * 0.35f)
+            cleanWeight[y * w + x] = skin * (1f - suspect) * (1f - suspect)
         }
         val cleanTarget = cleanWeightedBlurTarget(original, cleanWeight, fallbackTarget, w, h, donorRadius)
         val clusterTarget = cleanWeightedBlurTarget(original, cleanWeight, cleanTarget, w, h, clusterDonorRadius)
@@ -457,13 +448,13 @@ class ApplyBeautyUseCase {
 
             val compactTarget = cleanTarget[i]
             val wideTarget = clusterTarget[i]
-            val wideMix = smoothstep(0.10f, 0.52f, maxOf(repairA, calmA * 1.65f))
+            val wideMix = smoothstep(0.16f, 0.62f, maxOf(repairA, calmA * 1.4f))
             var tr = ((compactTarget shr 16 and 255) + ((wideTarget shr 16 and 255) - (compactTarget shr 16 and 255)) * wideMix)
             var tg = ((compactTarget shr 8 and 255) + ((wideTarget shr 8 and 255) - (compactTarget shr 8 and 255)) * wideMix)
             var tb = ((compactTarget and 255) + ((wideTarget and 255) - (compactTarget and 255)) * wideMix)
 
             // Prevent donor colour from crossing into unrelated nearby features or heavy lighting changes.
-            val maxDelta = 72f + 50f * strength
+            val maxDelta = 62f + 44f * strength
             tr = or + (tr - or).coerceIn(-maxDelta, maxDelta)
             tg = og + (tg - og).coerceIn(-maxDelta, maxDelta)
             tb = ob + (tb - ob).coerceIn(-maxDelta, maxDelta)
@@ -474,9 +465,9 @@ class ApplyBeautyUseCase {
 
             // Strong repairs may change luminance; diffuse redness calming mostly preserves the
             // original shade and transfers only cleaner chroma, avoiding a flat airbrushed patch.
-            val totalA = maxOf(repairA, calmA * 0.92f).coerceIn(0f, BLEMISH_MAX_ALPHA)
-            val luminanceReplace = smoothstep(0.08f, 0.62f, repairA)
-            val textureKeep = (0.23f - 0.15f * totalA).coerceIn(0.06f, 0.23f)
+            val totalA = maxOf(repairA, calmA * 0.82f).coerceIn(0f, BLEMISH_MAX_ALPHA)
+            val luminanceReplace = smoothstep(0.10f, 0.70f, repairA)
+            val textureKeep = (0.30f - 0.16f * totalA).coerceIn(0.10f, 0.30f)
             val repairedY = yt + (y0 - yd) * textureKeep
             val desiredY = (y0 + (repairedY - y0) * luminanceReplace).coerceIn(1f, 255f)
             val gain = desiredY / yt
@@ -1461,7 +1452,7 @@ class ApplyBeautyUseCase {
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.2f
         private const val BLEMISH_MAX_ALPHA         = 0.985f
-        private const val BLEMISH_DIFFUSE_REDNESS_ALPHA = 0.58f
+        private const val BLEMISH_DIFFUSE_REDNESS_ALPHA = 0.42f
         private const val MAX_BILATERAL_RADIUS      = 6       
         private const val BILATERAL_SPATIAL_SIGMA   = 3f       
         private const val BILATERAL_COLOR_SIGMA     = 30f      
