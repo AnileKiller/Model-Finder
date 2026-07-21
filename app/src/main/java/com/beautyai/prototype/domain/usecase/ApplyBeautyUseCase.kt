@@ -379,16 +379,6 @@ class ApplyBeautyUseCase {
             var tg = (target shr 8 and 255).toFloat()
             var tb = (target and 255).toFloat()
 
-            // 3. FORCE CLEAN THE TARGET COLOR. 
-            // Strips out residual redness without touching Blue, preventing dead gray patches.
-            val targetRedness = tr - tg
-            if (targetRedness > 12f) { // Tightened to 12f to catch more subtle acne redness
-                val excess = targetRedness - 12f
-                tr -= excess * 0.6f  // Pull down the harsh red
-                tg += excess * 0.3f  // Slightly bump green to maintain luminance
-                // Notice we do NOT touch 'tb' (Blue). This preserves the natural skin warmth.
-            }
-
             val y0 = 0.299f * or + 0.587f * og + 0.114f * ob
             val yd = 0.299f * dr + 0.587f * dg + 0.114f * db
             val yt = (0.299f * tr + 0.587f * tg + 0.114f * tb).coerceAtLeast(1f)
@@ -1319,8 +1309,8 @@ class ApplyBeautyUseCase {
         /** Nostrils / nose base — expanded to cover outer wings and bottom holes. */
         private val FEATURE_NOSE_BASE   = listOf(4, 45, 129, 98, 97, 2, 326, 327, 358, 275)
 
-        /** Bindi / Glabella zone (Custom 6-point shield). */
-        private val FEATURE_BINDI_ZONE  = listOf(10, 66, 107, 8, 336, 296)
+        /** Bindi / Glabella zone (Tight diamond centered between the eyebrows). */
+        private val FEATURE_BINDI_ZONE  = listOf(8, 107, 168, 336)
 
         // ── Eyes (canonical MediaPipe eye contour indices) — used only for
         // mask subtraction, to carve the eyeball/lash line back out of the
