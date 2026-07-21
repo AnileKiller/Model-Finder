@@ -1307,7 +1307,7 @@ class ApplyBeautyUseCase {
 
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.2f
-        private const val BLEMISH_MAX_ALPHA         = 0.985f
+        private const val BLEMISH_MAX_ALPHA         = 0.85f
         private const val MAX_BILATERAL_RADIUS      = 6       
         private const val BILATERAL_SPATIAL_SIGMA   = 3f       
         private const val BILATERAL_COLOR_SIGMA     = 30f      
