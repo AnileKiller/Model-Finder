@@ -325,27 +325,7 @@ class ApplyBeautyUseCase {
         val detail = gaussianApprox(original, w, h, detailRadius)
         val local  = gaussianApprox(original, w, h, localRadius)
         val size   = gaussianApprox(original, w, h, sizeRadius)
-
-        // Pass 1: rough anomaly weight so the annular fill source (below) excludes other
-        // flagged/marked pixels instead of averaging their colour in.
-        val sourceWeight = FloatArray(w * h)
-        for (y in 0 until h) for (x in 0 until w) {
-            val i = y * w + x
-            val o = original[i]; val b = local[i]
-            val r = o shr 16 and 255; val g = o shr 8 and 255; val bl = o and 255
-            val br = b shr 16 and 255; val bg = b shr 8 and 255; val bb = b and 255
-            val redResidual = (r - g - (br - bg)).toFloat()
-            val blueResidual = ((bl - maxOf(r, g)) - (bb - maxOf(br, bg))).toFloat()
-            val yellowResidual = (((r + g) * 0.5f - bl) - ((br + bg) * 0.5f - bb))
-            val chromaDistance = sqrt(((r - br) * (r - br) + (g - bg) * (g - bg) + (bl - bb) * (bl - bb)).toFloat())
-            val roughScore = maxOf(
-                smoothstep(7f, 28f, redResidual),
-                smoothstep(18f, 50f, blueResidual) * smoothstep(28f, 70f, chromaDistance),
-                smoothstep(18f, 50f, yellowResidual) * smoothstep(28f, 70f, chromaDistance)
-            )
-            sourceWeight[i] = 1f - roughScore
-        }
-        val inpaintTarget = weightedAnnularBlur(original, sourceWeight, w, h, annulusInnerRadius, annulusOuterRadius)
+        val inpaintTarget = annularBlur(original, w, h, annulusInnerRadius, annulusOuterRadius)
 
         val alphaMap = Array(h) { FloatArray(w) }
         var hits = 0; var alphaSum = 0f
@@ -375,10 +355,12 @@ class ApplyBeautyUseCase {
                 ((r - br) * (r - br) + (g - bg) * (g - bg) + (bl - bb) * (bl - bb)).toFloat()
             )
 
-            val redScore = smoothstep(7f, 28f, redResidual)
-            val blueScore = smoothstep(18f, 50f, blueResidual) * smoothstep(28f, 70f, chromaDistance)
-            val yellowScore = smoothstep(18f, 50f, yellowResidual) * smoothstep(28f, 70f, chromaDistance)
-            val greenScore = smoothstep(14f, 40f, greenResidual)
+            // Tuned from the BeautyAI-vs-BeautyEditor comparison:
+            // red/blue synthetic spots were still under-corrected, while yellow was too strong.
+            val redScore = smoothstep(5f, 22f, redResidual)
+            val blueScore = smoothstep(12f, 38f, blueResidual) * smoothstep(22f, 60f, chromaDistance)
+            val yellowScore = smoothstep(24f, 68f, yellowResidual) * smoothstep(40f, 90f, chromaDistance) * 0.45f
+            val greenScore = smoothstep(10f, 32f, greenResidual)
             val darkScore = smoothstep(8f, 24f, darkResidual)
 
             // Large features persist at the broader scale. Small blemishes do not.
@@ -398,13 +380,15 @@ class ApplyBeautyUseCase {
                 kotlin.math.abs(sizeYellowResidual)
             )
             val persistence = persistentMagnitude / residualMagnitude
-            val sizeGate = 1f - smoothstep(0.42f, 0.86f, persistence)
+            // Let medium-size coloured marks be corrected more strongly; very persistent broad
+            // colour fields still survive, which prevents the whole blue-tinted face being caught.
+            val sizeGate = 1f - smoothstep(0.55f, 1.10f, persistence)
 
             // Darkness alone is not enough; it needs some red/yellow/blue abnormality so pores,
             // freckles, moles and facial edges do not get washed out.
-            val chromaScore = maxOf(redScore, blueScore, yellowScore)
-            val score = maxOf(chromaScore, darkScore * (0.20f + 0.80f * chromaScore))
-            val a = (score * (1f - greenScore) * sizeGate * maskValue * strength)
+            val chromaScore = maxOf(redScore * 1.18f, blueScore * 1.28f, yellowScore)
+            val score = maxOf(chromaScore, darkScore * (0.12f + 0.68f * chromaScore))
+            val a = (score * (1f - greenScore) * sizeGate * maskValue * strength * 1.08f)
                 .coerceIn(0f, BLEMISH_MAX_ALPHA)
 
             alphaMap[y][x] = a
@@ -470,70 +454,6 @@ class ApplyBeautyUseCase {
             val g = (((op shr 8 and 255) * outerArea - (ip shr 8 and 255) * innerArea) / ringArea).coerceIn(0, 255)
             val b = (((op and 255) * outerArea - (ip and 255) * innerArea) / ringArea).coerceIn(0, 255)
             out[i] = (src[i] and -0x1000000) or (r shl 16) or (g shl 8) or b
-        }
-        return out
-    }
-
-    /** Same ring-average idea as annularBlur, but pixels flagged as their own blemish
-     *  (low sourceWeight) barely contribute — so a nearby, unrelated mark/blemish
-     *  doesn't bleed its colour into this pixel's fill target. */
-    private fun weightedAnnularBlur(
-        src: IntArray, weight: FloatArray, w: Int, h: Int, innerRadius: Int, outerRadius: Int
-    ): IntArray {
-        val n = w * h
-        val wr = FloatArray(n); val wg = FloatArray(n); val wb = FloatArray(n)
-        for (i in 0 until n) {
-            val p = src[i]; val wt = weight[i]
-            wr[i] = (p shr 16 and 255) * wt
-            wg[i] = (p shr 8 and 255) * wt
-            wb[i] = (p and 255) * wt
-        }
-        fun boxAvg(a: FloatArray, r: Int) = boxBlurFloat(a, w, h, r)
-
-        val rIn = boxAvg(wr, innerRadius); val rOut = boxAvg(wr, outerRadius)
-        val gIn = boxAvg(wg, innerRadius); val gOut = boxAvg(wg, outerRadius)
-        val bIn = boxAvg(wb, innerRadius); val bOut = boxAvg(wb, outerRadius)
-        val wIn = boxAvg(weight, innerRadius); val wOut = boxAvg(weight, outerRadius)
-
-        val innerArea = (2 * innerRadius + 1) * (2 * innerRadius + 1)
-        val outerArea = (2 * outerRadius + 1) * (2 * outerRadius + 1)
-
-        val out = IntArray(n)
-        for (i in 0 until n) {
-            val ringWeight = (wOut[i] * outerArea - wIn[i] * innerArea).coerceAtLeast(0.01f)
-            val r = ((rOut[i] * outerArea - rIn[i] * innerArea) / ringWeight).coerceIn(0f, 255f).toInt()
-            val g = ((gOut[i] * outerArea - gIn[i] * innerArea) / ringWeight).coerceIn(0f, 255f).toInt()
-            val b = ((bOut[i] * outerArea - bIn[i] * innerArea) / ringWeight).coerceIn(0f, 255f).toInt()
-            out[i] = (src[i] and -0x1000000) or (r shl 16) or (g shl 8) or b
-        }
-        return out
-    }
-
-    /** Separable box-average over a flat float channel — same sliding-window approach as
-     *  gaussianBlur, just on Float instead of packed Int pixels. */
-    private fun boxBlurFloat(src: FloatArray, w: Int, h: Int, radius: Int): FloatArray {
-        val tmp = FloatArray(w * h)
-        val out = FloatArray(w * h)
-        val size = 2 * radius + 1
-        for (y in 0 until h) {
-            var sum = 0f
-            for (k in -radius..radius) sum += src[y * w + k.coerceIn(0, w - 1)]
-            for (x in 0 until w) {
-                tmp[y * w + x] = sum / size
-                val addX = (x + radius + 1).coerceIn(0, w - 1)
-                val remX = (x - radius).coerceIn(0, w - 1)
-                sum += src[y * w + addX] - src[y * w + remX]
-            }
-        }
-        for (x in 0 until w) {
-            var sum = 0f
-            for (k in -radius..radius) sum += tmp[k.coerceIn(0, h - 1) * w + x]
-            for (y in 0 until h) {
-                out[y * w + x] = sum / size
-                val addY = (y + radius + 1).coerceIn(0, h - 1)
-                val remY = (y - radius).coerceIn(0, h - 1)
-                sum += tmp[addY * w + x] - tmp[remY * w + x]
-            }
         }
         return out
     }
@@ -1386,7 +1306,7 @@ class ApplyBeautyUseCase {
 
         // Skin smoothing
         private const val MASK_THRESHOLD            = 0.2f
-        private const val BLEMISH_MAX_ALPHA         = 0.94f
+        private const val BLEMISH_MAX_ALPHA         = 0.985f
         private const val MAX_BILATERAL_RADIUS      = 6       
         private const val BILATERAL_SPATIAL_SIGMA   = 3f       
         private const val BILATERAL_COLOR_SIGMA     = 30f      
