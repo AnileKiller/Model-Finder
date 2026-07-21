@@ -386,10 +386,11 @@ class ApplyBeautyUseCase {
 
             // Darkness alone is not enough; it needs some red/yellow/blue abnormality so pores,
             // freckles, moles and facial edges do not get washed out.
-            val chromaScore = maxOf(redScore * 1.18f, blueScore * 1.28f, yellowScore)
+            val chromaScore = maxOf(redScore, blueScore, yellowScore)
             val score = maxOf(chromaScore, darkScore * (0.12f + 0.68f * chromaScore))
-            val a = (score * (1f - greenScore) * sizeGate * maskValue * strength * 1.08f)
-                .coerceIn(0f, BLEMISH_MAX_ALPHA)
+            // Hard cap at 85% to prevent total plastic removal, but ensure it scales to 100%
+            val a = (score * (1f - greenScore) * sizeGate * maskValue * strength)
+                .coerceIn(0f, 0.85f)
 
             alphaMap[y][x] = a
             if (a > 0.02f) { hits++; alphaSum += a }
