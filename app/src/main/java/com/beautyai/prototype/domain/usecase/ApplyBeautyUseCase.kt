@@ -38,11 +38,14 @@ class ApplyBeautyUseCase {
         // reduced 0.4x strength baked into the detector) x the face-oval
         // geometric mask, then feathered. Used for effects that should still
         // reach past the jawline onto visible neck skin, just less strongly.
-        val smoothMask = preBlurMask(
+        // Ocular shield applied AFTER blur so it has a genuinely hard edge and
+        // can't be eroded away by the blur radius.
+        var smoothMask = preBlurMask(
             multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 12
         )
+        smoothMask = applyOcularSmoothingShield(smoothMask, faceData, source.width, source.height)
 
-        // ADD THIS — prevents bilateral filter from smearing under-eye skin
+        // Prevents bilateral filter from smearing under-eye skin
         val eyeBagExcludedSmoothMask = punchRegionsIntoMask(
             smoothMask, faceData,
             listOf(
@@ -61,10 +64,11 @@ class ApplyBeautyUseCase {
         // Blemishes must be detected on the unsharpened image: sharpening turns pores
         // and compression texture into false positives. Unlike sharpMask, this mask has
         // segmentation and feature exclusions, so it is safe around eyes/lips/hair.
-        // Blemishes must be detected on the unsharpened image.
+        // Ocular shield applied post-blur (hard edge) via the same helper used for smoothMask.
         var blemishMask = preBlurMask(
             multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 2
         )
+        blemishMask = applyOcularSmoothingShield(blemishMask, faceData, source.width, source.height)
 
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
@@ -1289,59 +1293,89 @@ class ApplyBeautyUseCase {
         return bitmapToFloatArray(maskBitmap, w, h)
     }
 
+    // refinedMask stays TIGHT (no eyelid shield, no padding) — under-eye
+    // reduction below needs unobstructed access to the true eye-bag zone.
     private fun punchExclusionZones(
-    baseMask: Array<FloatArray>,
-    faceData: FaceData,
-    w: Int,
-    h: Int
-): Array<FloatArray> {
-    val maskBitmap = floatArrayToBitmap(baseMask, w, h)
-    val canvas = Canvas(maskBitmap)
+        baseMask: Array<FloatArray>,
+        faceData: FaceData,
+        w: Int,
+        h: Int
+    ): Array<FloatArray> {
+        val maskBitmap = floatArrayToBitmap(baseMask, w, h)
+        val canvas = Canvas(maskBitmap)
 
-    val eraserPaint = Paint().apply {
-        color = Color.BLACK
-        style = Paint.Style.FILL
-        isAntiAlias = true
-    }
-
-    // Ocular zone gets a padded eraser: FILL_AND_STROKE grows the punched
-    // hole outward by strokeWidth/2 px on every edge, covering crow's-feet
-    // and under-eye skin just past the tight lash-line/brow contour.
-    val ocularEraserPaint = Paint().apply {
-        color = Color.BLACK
-        style = Paint.Style.FILL_AND_STROKE
-        strokeWidth = 24f   // ~12px padding each direction — tune to taste
-        isAntiAlias = true
-    }
-
-    fun drawPolygon(indices: List<Int>, paint: Paint = eraserPaint) {
-        if (indices.isEmpty()) return
-        val path = Path()
-        val first = faceData.landmarks[indices[0]]
-        path.moveTo(first.x * w, first.y * h)
-        for (i in 1 until indices.size) {
-            val lm = faceData.landmarks[indices[i]]
-            path.lineTo(lm.x * w, lm.y * h)
+        val eraserPaint = Paint().apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL
+            isAntiAlias = true
         }
-        path.close()
-        canvas.drawPath(path, paint)
+
+        fun drawPolygon(indices: List<Int>) {
+            if (indices.isEmpty()) return
+            val path = Path()
+            val first = faceData.landmarks[indices[0]]
+            path.moveTo(first.x * w, first.y * h)
+            for (i in 1 until indices.size) {
+                val lm = faceData.landmarks[indices[i]]
+                path.lineTo(lm.x * w, lm.y * h)
+            }
+            path.close()
+            canvas.drawPath(path, eraserPaint)
+        }
+
+        // Tight exclusions only — no stroke padding, no eyelid polygons.
+        // The padded ocular shield is applied separately to smoothMask and
+        // blemishMask via applyOcularSmoothingShield(), so it never bleeds
+        // into the eye-bag zone that underEyeReduction depends on.
+        drawPolygon(FEATURE_LEFT_EYE)
+        drawPolygon(FEATURE_RIGHT_EYE)
+        drawPolygon(FEATURE_LEFT_BROW)
+        drawPolygon(FEATURE_RIGHT_BROW)
+        drawPolygon(FEATURE_LIPS_OUTER)
+        drawPolygon(FEATURE_NOSE_BASE)
+        drawPolygon(FEATURE_BINDI_ZONE)
+
+        return bitmapToFloatArray(maskBitmap, w, h)
     }
 
-    // Ocular Zone — padded to survive the later 12px smoothMask blur and
-    // cover crow's-feet / under-eye skin just outside the tight contour.
-    drawPolygon(FEATURE_LEFT_EYE, ocularEraserPaint)
-    drawPolygon(FEATURE_RIGHT_EYE, ocularEraserPaint)
-    drawPolygon(FEATURE_LEFT_BROW, ocularEraserPaint)
-    drawPolygon(FEATURE_RIGHT_BROW, ocularEraserPaint)
-    drawPolygon(FEATURE_LEFT_EYELID, ocularEraserPaint)
-    drawPolygon(FEATURE_RIGHT_EYELID, ocularEraserPaint)
-
-    drawPolygon(FEATURE_LIPS_OUTER)
-    drawPolygon(FEATURE_NOSE_BASE)
-    drawPolygon(FEATURE_BINDI_ZONE)
-
-    return bitmapToFloatArray(maskBitmap, w, h)
-}
+    /** Padded ocular shield — applied ONLY to the smoothing/blemish pipeline,
+     *  never to refinedMask, so it can't suppress under-eye reduction.
+     *  Applied after the pre-blur so the shield edge stays hard and isn't
+     *  eroded away by the blur radius. */
+    private fun applyOcularSmoothingShield(
+        baseMask: Array<FloatArray>,
+        faceData: FaceData,
+        w: Int,
+        h: Int
+    ): Array<FloatArray> {
+        val maskBitmap = floatArrayToBitmap(baseMask, w, h)
+        val canvas = Canvas(maskBitmap)
+        val ocularEraserPaint = Paint().apply {
+            color = Color.BLACK
+            style = Paint.Style.FILL_AND_STROKE
+            strokeWidth = 24f   // ~12px padding each direction
+            isAntiAlias = true
+        }
+        fun drawPolygon(indices: List<Int>) {
+            if (indices.isEmpty()) return
+            val path = Path()
+            val first = faceData.landmarks[indices[0]]
+            path.moveTo(first.x * w, first.y * h)
+            for (i in 1 until indices.size) {
+                val lm = faceData.landmarks[indices[i]]
+                path.lineTo(lm.x * w, lm.y * h)
+            }
+            path.close()
+            canvas.drawPath(path, ocularEraserPaint)
+        }
+        drawPolygon(FEATURE_LEFT_EYE)
+        drawPolygon(FEATURE_RIGHT_EYE)
+        drawPolygon(FEATURE_LEFT_BROW)
+        drawPolygon(FEATURE_RIGHT_BROW)
+        drawPolygon(FEATURE_LEFT_EYELID)
+        drawPolygon(FEATURE_RIGHT_EYELID)
+        return bitmapToFloatArray(maskBitmap, w, h)
+    }
     /**
      * Converts a 2-D FloatArray mask (values 0–1) into a greyscale ARGB_8888 Bitmap
      * so Android Canvas can draw exclusion polygons onto it.
@@ -1413,7 +1447,7 @@ class ApplyBeautyUseCase {
             33, 7, 163, 144, 145, 153, 154, 155, // outer corner -> lower lid -> inner corner
             133
         )
-        
+
         /** Right Eyelid — mirrored */
         private val FEATURE_RIGHT_EYELID = listOf(
             336, 285, 295, 282, 283, 276,
