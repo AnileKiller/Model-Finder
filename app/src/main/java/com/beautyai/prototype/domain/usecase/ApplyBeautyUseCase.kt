@@ -1290,52 +1290,58 @@ class ApplyBeautyUseCase {
     }
 
     private fun punchExclusionZones(
-        baseMask: Array<FloatArray>,
-        faceData: FaceData,
-        w: Int,
-        h: Int
-    ): Array<FloatArray> {
-        val maskBitmap = floatArrayToBitmap(baseMask, w, h)
-        val canvas = Canvas(maskBitmap)
+    baseMask: Array<FloatArray>,
+    faceData: FaceData,
+    w: Int,
+    h: Int
+): Array<FloatArray> {
+    val maskBitmap = floatArrayToBitmap(baseMask, w, h)
+    val canvas = Canvas(maskBitmap)
 
-        val eraserPaint = Paint().apply {
-            color = Color.BLACK
-            style = Paint.Style.FILL
-            isAntiAlias = true
-        }
-
-        fun drawPolygon(indices: List<Int>) {
-            if (indices.isEmpty()) return
-            val path = Path()
-            val first = faceData.landmarks[indices[0]]
-            path.moveTo(first.x * w, first.y * h)
-            for (i in 1 until indices.size) {
-                val lm = faceData.landmarks[indices[i]]
-                path.lineTo(lm.x * w, lm.y * h)
-            }
-            path.close()
-            canvas.drawPath(path, eraserPaint)
-        }
-
-        // Ocular Zone (Tight geometry for the global pipeline)
-        drawPolygon(FEATURE_LEFT_EYE)
-        drawPolygon(FEATURE_RIGHT_EYE)
-        drawPolygon(FEATURE_LEFT_BROW)
-        drawPolygon(FEATURE_RIGHT_BROW)
-        drawPolygon(FEATURE_LEFT_EYELID)   // ADD: closes the brow↔eye crease gap
-        drawPolygon(FEATURE_RIGHT_EYELID)  // for every mask derived from refinedMask
-        // Lips
-        drawPolygon(FEATURE_LIPS_OUTER)
-
-        // Nostrils / nose base (Expanded)
-        drawPolygon(FEATURE_NOSE_BASE)
-
-        // Bindi / Forehead Center
-        drawPolygon(FEATURE_BINDI_ZONE)
-
-        return bitmapToFloatArray(maskBitmap, w, h)
+    val eraserPaint = Paint().apply {
+        color = Color.BLACK
+        style = Paint.Style.FILL
+        isAntiAlias = true
     }
 
+    // Ocular zone gets a padded eraser: FILL_AND_STROKE grows the punched
+    // hole outward by strokeWidth/2 px on every edge, covering crow's-feet
+    // and under-eye skin just past the tight lash-line/brow contour.
+    val ocularEraserPaint = Paint().apply {
+        color = Color.BLACK
+        style = Paint.Style.FILL_AND_STROKE
+        strokeWidth = 24f   // ~12px padding each direction — tune to taste
+        isAntiAlias = true
+    }
+
+    fun drawPolygon(indices: List<Int>, paint: Paint = eraserPaint) {
+        if (indices.isEmpty()) return
+        val path = Path()
+        val first = faceData.landmarks[indices[0]]
+        path.moveTo(first.x * w, first.y * h)
+        for (i in 1 until indices.size) {
+            val lm = faceData.landmarks[indices[i]]
+            path.lineTo(lm.x * w, lm.y * h)
+        }
+        path.close()
+        canvas.drawPath(path, paint)
+    }
+
+    // Ocular Zone — padded to survive the later 12px smoothMask blur and
+    // cover crow's-feet / under-eye skin just outside the tight contour.
+    drawPolygon(FEATURE_LEFT_EYE, ocularEraserPaint)
+    drawPolygon(FEATURE_RIGHT_EYE, ocularEraserPaint)
+    drawPolygon(FEATURE_LEFT_BROW, ocularEraserPaint)
+    drawPolygon(FEATURE_RIGHT_BROW, ocularEraserPaint)
+    drawPolygon(FEATURE_LEFT_EYELID, ocularEraserPaint)
+    drawPolygon(FEATURE_RIGHT_EYELID, ocularEraserPaint)
+
+    drawPolygon(FEATURE_LIPS_OUTER)
+    drawPolygon(FEATURE_NOSE_BASE)
+    drawPolygon(FEATURE_BINDI_ZONE)
+
+    return bitmapToFloatArray(maskBitmap, w, h)
+}
     /**
      * Converts a 2-D FloatArray mask (values 0–1) into a greyscale ARGB_8888 Bitmap
      * so Android Canvas can draw exclusion polygons onto it.
