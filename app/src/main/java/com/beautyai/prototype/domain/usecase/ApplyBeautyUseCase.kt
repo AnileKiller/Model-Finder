@@ -1408,12 +1408,19 @@ class ApplyBeautyUseCase {
         /** Bindi / Glabella zone (Custom 8-point shield mapping the lower forehead and brow gap). */
         private val FEATURE_BINDI_ZONE = listOf(108, 151, 337, 336, 285, 168, 55, 107)
 
-        /** Left Eyelid (Outer->Inner lower brow, then Inner->Outer upper eye) */
-        private val FEATURE_LEFT_EYELID = listOf(156, 46, 53, 52, 65, 221, 189, 243, 173, 157, 158, 159, 160, 161, 246, 33, 25, 130, 226, 35)
-
-        /** Right Eyelid (Outer->Inner lower brow, then Inner->Outer upper eye) */
-        private val FEATURE_RIGHT_EYELID = listOf(413, 441, 295, 282, 283, 277, 353, 446, 359, 263, 466, 388, 387, 386, 385, 384, 398, 463, 464)
-
+        /** Left Eyelid — brow strip down to outer corner, along LOWER lid, back up to inner corner */
+        private val FEATURE_LEFT_EYELID = listOf(
+            107, 55, 65, 52, 53, 46,           // lower brow edge, inner -> outer
+            33, 7, 163, 144, 145, 153, 154, 155, // outer corner -> lower lid -> inner corner
+            133
+        )
+        
+        /** Right Eyelid — mirrored */
+        private val FEATURE_RIGHT_EYELID = listOf(
+            336, 285, 295, 282, 283, 276,
+            263, 249, 390, 373, 374, 380, 381, 382,
+            362
+        )
         // ── Eyes (canonical MediaPipe eye contour indices) — used only for
         // mask subtraction, to carve the eyeball/lash line back out of the
         // heavily-blurred eye-bag mask.
