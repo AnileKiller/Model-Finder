@@ -340,17 +340,12 @@ class ApplyBeautyUseCase {
         val detailRadius = (faceScale * 0.0045f).toInt().coerceIn(1, 3)
         val localRadius = (faceScale * 0.018f).toInt().coerceIn(5, 12)
         val broadRadius = (faceScale * 0.055f).toInt().coerceIn(16, 36)
+        val donorRadius = (faceScale * 0.065f).toInt().coerceIn(18, 42)
+        val growRadius = (faceScale * 0.006f).toInt().coerceIn(2, 4)
 
         val detailBase = gaussianApprox(original, w, h, detailRadius)
-        val localBase  = gaussianApprox(original, w, h, localRadius)
-        val broadBase  = gaussianApprox(original, w, h, broadRadius)
-
-        // 1. MASSIVE SPREAD: Pushes the detected spots outward until they bridge together
-        val growRadius = (faceScale * 0.065f).toInt().coerceIn(24, 48)
-
-        // 2. EXTREME DONOR REACH: Because the repair mask now covers the whole cheek, 
-        // the donor must search past the cheek to find clean skin near the ears and jawline.
-        val donorRadius = (faceScale * 0.120f).toInt().coerceIn(48, 96)
+        val localBase = gaussianApprox(original, w, h, localRadius)
+        val broadBase = gaussianApprox(original, w, h, broadRadius)
 
         // Detection confidence is deliberately independent of the UI strength. Otherwise low
         // strength allows blemishes back into the donor pool and contaminates their replacement.
@@ -426,11 +421,7 @@ class ApplyBeautyUseCase {
 
         // Grow from the detected core to cover the whole lesion, then feather the boundary.
         val grown = maxFilterMask(confidence, w, h, growRadius)
-        // 3. HEAVY FEATHER: Smooths the massive grown mask so it blends organically 
-        // into the excluded boundaries without leaving hard lines.
-        val featherRadius = (faceScale * 0.035f).toInt().coerceIn(12, 24)
-        val repairMask = preBlurMask(grown, w, h, featherRadius)
-
+        val repairMask = preBlurMask(grown, w, h, growRadius)
 
         // Build a donor only from pixels that are both skin and confidently clean. This is the
         // critical fix for dense acne: the lesion can no longer donate its own red colour.
@@ -443,11 +434,9 @@ class ApplyBeautyUseCase {
         }
         // A wider clean-only pass is the fallback for dense clusters with too little nearby
         // support. Only its final emergency fallback contains unfiltered broad colour.
-        // 4. INCREASE MAXIMUM FALLBACK REACH: Let the fallback donor actually escape the cluster
         val farDonor = cleanWeightedBlurTarget(
-            detailBase, cleanWeight, broadBase, w, h, (donorRadius * 2).coerceAtMost(160)
+            detailBase, cleanWeight, broadBase, w, h, (donorRadius * 2).coerceAtMost(72)
         )
-
         val donor = cleanWeightedBlurTarget(
             detailBase, cleanWeight, farDonor, w, h, donorRadius
         )
