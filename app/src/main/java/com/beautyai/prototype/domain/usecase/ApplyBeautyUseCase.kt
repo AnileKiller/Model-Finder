@@ -66,12 +66,13 @@ class ApplyBeautyUseCase {
             multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 2
         )
 
-        // ISOLATED SHIELD: Protect the eyelashes and eye bags from the blemish blur
+        // ISOLATED SHIELD: Surgically protect the delicate eyelid skin between the eye and brow
         blemishMask = punchRegionsIntoMask(
             blemishMask, faceData,
-            listOf(FEATURE_LEFT_ORBIT, FEATURE_RIGHT_ORBIT),
+            listOf(FEATURE_LEFT_EYELID, FEATURE_RIGHT_EYELID),
             source.width, source.height
         )
+
 
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
@@ -1407,11 +1408,11 @@ class ApplyBeautyUseCase {
         /** Bindi / Glabella zone (Tight diamond centered between the eyebrows). */
         private val FEATURE_BINDI_ZONE  = listOf(8, 107, 168, 336)
 
-        /** Left Orbit (Inner brow -> Outer brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
-        private val FEATURE_LEFT_ORBIT  = listOf(70, 63, 105, 66, 107, 55, 65, 52, 53, 46, 111, 117, 118, 119, 120, 121, 128)
+        /** Left Eyelid (Inner->Outer lower brow, then Outer->Inner upper eye) */
+        private val FEATURE_LEFT_EYELID = listOf(55, 65, 52, 53, 46, 33, 246, 161, 160, 159, 158, 157, 173, 133)
 
-        /** Right Orbit (Inner brow -> Outer brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
-        private val FEATURE_RIGHT_ORBIT = listOf(300, 293, 334, 296, 336, 285, 295, 282, 283, 276, 340, 346, 347, 348, 349, 350, 357)
+        /** Right Eyelid (Inner->Outer lower brow, then Outer->Inner upper eye) */
+        private val FEATURE_RIGHT_EYELID = listOf(285, 295, 282, 283, 276, 263, 466, 388, 387, 386, 385, 384, 398, 362)
 
         // ── Eyes (canonical MediaPipe eye contour indices) — used only for
         // mask subtraction, to carve the eyeball/lash line back out of the
