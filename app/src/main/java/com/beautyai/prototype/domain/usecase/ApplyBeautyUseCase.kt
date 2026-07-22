@@ -1406,7 +1406,7 @@ class ApplyBeautyUseCase {
         private val FEATURE_NOSE_BASE   = listOf(4, 45, 129, 98, 97, 2, 326, 327, 358, 275)
 
         /** Bindi / Glabella zone (Custom 8-point shield mapping the lower forehead and brow gap). */
-        private val FEATURE_BINDI_ZONE = listOf(168, 55, 107, 108, 121, 337, 336, 285)
+        private val FEATURE_BINDI_ZONE = listOf(108, 151, 337, 336, 285, 168, 55, 107)
 
         /** Left Eyelid (Outer->Inner lower brow, then Inner->Outer upper eye) */
         private val FEATURE_LEFT_EYELID = listOf(156, 46, 53, 52, 65, 55, 193, 243, 133, 173, 157, 158, 159, 160, 161, 246, 33, 25, 35)
