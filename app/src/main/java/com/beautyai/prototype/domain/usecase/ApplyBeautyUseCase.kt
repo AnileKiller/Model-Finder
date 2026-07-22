@@ -66,14 +66,6 @@ class ApplyBeautyUseCase {
             multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 2
         )
 
-        // ISOLATED SHIELD: Surgically protect the delicate eyelid skin between the eye and brow
-        blemishMask = punchRegionsIntoMask(
-            blemishMask, faceData,
-            listOf(FEATURE_LEFT_EYELID, FEATURE_RIGHT_EYELID),
-            source.width, source.height
-        )
-
-
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
 
