@@ -316,13 +316,13 @@ class ApplyBeautyUseCase {
 
         val detailRadius = (faceScale * 0.006f).toInt().coerceIn(1, 4)
         
-        // 1. MASSIVE RADII: To escape dense acne clusters
-        val localRadius  = (faceScale * 0.040f).toInt().coerceIn(12, 24)
-        val sizeRadius   = (faceScale * 0.080f).toInt().coerceIn(24, 48)
+        // 1. MASSIVE RADII: Doubled again to completely clear severe, full-cheek clusters
+        val localRadius  = (faceScale * 0.080f).toInt().coerceIn(24, 48)
+        val sizeRadius   = (faceScale * 0.160f).toInt().coerceIn(48, 96)
 
-        // 2. ANNULAR TARGET: Pushed outward to only sample healthy donor skin
-        val annulusInnerRadius = (faceScale * 0.040f).toInt().coerceIn(12, 24)
-        val annulusOuterRadius = (faceScale * 0.080f).toInt().coerceIn(24, 48).coerceAtLeast(annulusInnerRadius + 4)
+        // 2. ANNULAR TARGET: Pushed far out to reach pure, unblemished skin near the jaw/ears
+        val annulusInnerRadius = (faceScale * 0.080f).toInt().coerceIn(24, 48)
+        val annulusOuterRadius = (faceScale * 0.160f).toInt().coerceIn(48, 96).coerceAtLeast(annulusInnerRadius + 4)
 
         val detail = gaussianApprox(original, w, h, detailRadius)
         val local  = gaussianApprox(original, w, h, localRadius)
@@ -348,21 +348,21 @@ class ApplyBeautyUseCase {
             val pixelY = 0.299f * r + 0.587f * g + 0.114f * bl
             val darkResidual = localY - pixelY
 
-            // Aggressive thresholds
-            val redScore = smoothstep(2f, 20f, redResidual)
+            // 3. OVERDRIVE DETECTION: Lower the threshold to catch faded edges and multiply intensity
+            val redScore = smoothstep(0f, 15f, redResidual)
             val darkScore = smoothstep(8f, 24f, darkResidual)
 
-            // Strict Mixing: Darkness only counts if it is ALSO red. Protects normal moles/freckles.
-            val score = maxOf(redScore, darkScore * redScore) 
+            // Multiply the final score to overdrive the opacity over dense patches
+            val score = maxOf(redScore, darkScore * redScore) * 1.8f 
             
-            // No size gate, no morphological blob filters.
             val a = (score * maskValue * strength).coerceIn(0f, BLEMISH_MAX_ALPHA)
 
             alphaMap[y][x] = a
             if (a > 0.02f) { hits++; alphaSum += a }
         }
 
-        val feathered = preBlurMask(alphaMap, w, h, 2) 
+        // 4. THE SPREAD: Increase feathering radius from 2 to 8 to naturally expand the healing zone
+        val feathered = preBlurMask(alphaMap, w, h, 8) 
         val out = original.copyOf()
         
         // ── PASS 2: Chrominance Transfer & Texture Rebuild ──
@@ -383,8 +383,8 @@ class ApplyBeautyUseCase {
             val yd = 0.299f * dr + 0.587f * dg + 0.114f * db
             val yt = (0.299f * tr + 0.587f * tg + 0.114f * tb).coerceAtLeast(1f)
             
-            // 4. TEXTURE RESTORE: 35% of luminance detail to avoid flat plastic skin.
-            val desiredY = (yt + (y0 - yd) * 0.35f).coerceAtLeast(1f)
+            // 5. TEXTURE REDUCTION: Drop from 35% to 10% to prevent pasting 3D pimple shadows back on
+            val desiredY = (yt + (y0 - yd) * 0.10f).coerceAtLeast(1f)
             val gain = desiredY / yt
             tr *= gain; tg *= gain; tb *= gain
 
