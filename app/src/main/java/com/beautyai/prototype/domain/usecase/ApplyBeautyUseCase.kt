@@ -1330,7 +1330,8 @@ class ApplyBeautyUseCase {
         drawPolygon(FEATURE_RIGHT_EYE)
         drawPolygon(FEATURE_LEFT_BROW)
         drawPolygon(FEATURE_RIGHT_BROW)
-
+        drawPolygon(FEATURE_LEFT_EYELID)   // ADD: closes the brow↔eye crease gap
+        drawPolygon(FEATURE_RIGHT_EYELID)  // for every mask derived from refinedMask
         // Lips
         drawPolygon(FEATURE_LIPS_OUTER)
 
