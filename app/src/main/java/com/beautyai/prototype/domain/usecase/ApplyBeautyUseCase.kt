@@ -1340,8 +1340,9 @@ class ApplyBeautyUseCase {
 
     /** Padded ocular shield — applied ONLY to the smoothing/blemish pipeline,
      *  never to refinedMask, so it can't suppress under-eye reduction.
-     *  Applied after the pre-blur so the shield edge stays hard and isn't
-     *  eroded away by the blur radius. */
+     *  Applied after the pre-blur so the 24px stroke expansion can't be eroded
+     *  away; the BlurMaskFilter feather gives the boundary a soft transition
+     *  instead of a hard cut. */
     private fun applyOcularSmoothingShield(
         baseMask: Array<FloatArray>,
         faceData: FaceData,
@@ -1350,11 +1351,15 @@ class ApplyBeautyUseCase {
     ): Array<FloatArray> {
         val maskBitmap = floatArrayToBitmap(baseMask, w, h)
         val canvas = Canvas(maskBitmap)
+
+        val feather = 14f  // px — soft transition width, tune to taste
+
         val ocularEraserPaint = Paint().apply {
             color = Color.BLACK
             style = Paint.Style.FILL_AND_STROKE
-            strokeWidth = 24f   // ~12px padding each direction
+            strokeWidth = 24f
             isAntiAlias = true
+            maskFilter = BlurMaskFilter(feather, BlurMaskFilter.Blur.NORMAL)
         }
         fun drawPolygon(indices: List<Int>) {
             if (indices.isEmpty()) return
