@@ -341,6 +341,10 @@ class ApplyBeautyUseCase {
         val localRadius = (faceScale * 0.018f).toInt().coerceIn(5, 12)
         val broadRadius = (faceScale * 0.055f).toInt().coerceIn(16, 36)
 
+        val detailBase = gaussianApprox(original, w, h, detailRadius)
+        val localBase  = gaussianApprox(original, w, h, localRadius)
+        val broadBase  = gaussianApprox(original, w, h, broadRadius)
+
         // 1. MASSIVE SPREAD: Pushes the detected spots outward until they bridge together
         val growRadius = (faceScale * 0.065f).toInt().coerceIn(24, 48)
 
