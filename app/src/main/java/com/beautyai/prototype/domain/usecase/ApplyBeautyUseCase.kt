@@ -100,7 +100,7 @@ class ApplyBeautyUseCase {
                 faceData, allBagTiers, source.width, source.height, 20f
             )
 
-            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, refinedMask, effective.underEyeReduction)
+            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, faceData.segmentationMask, effective.underEyeReduction)
         }
 
         if (effective.eyeBrightness > 0f) {
@@ -340,10 +340,10 @@ class ApplyBeautyUseCase {
         val detailRadius = (faceScale * 0.0045f).toInt().coerceIn(1, 3)
         val localRadius = (faceScale * 0.018f).toInt().coerceIn(5, 12)
         val broadRadius = (faceScale * 0.055f).toInt().coerceIn(16, 36)
-        
+
         // 1. MASSIVE SPREAD: Pushes the detected spots outward until they bridge together
         val growRadius = (faceScale * 0.065f).toInt().coerceIn(24, 48)
-        
+
         // 2. EXTREME DONOR REACH: Because the repair mask now covers the whole cheek, 
         // the donor must search past the cheek to find clean skin near the ears and jawline.
         val donorRadius = (faceScale * 0.120f).toInt().coerceIn(48, 96)
@@ -1322,11 +1322,9 @@ class ApplyBeautyUseCase {
             canvas.drawPath(path, eraserPaint)
         }
 
-        // Ocular Zone (Eyes and Eyebrows)
-        drawPolygon(FEATURE_LEFT_EYE)
-        drawPolygon(FEATURE_RIGHT_EYE)
-        drawPolygon(FEATURE_LEFT_BROW)
-        drawPolygon(FEATURE_RIGHT_BROW)
+        // Ocular Zone (Massive combined shield for eyes, lids, brows, and bags)
+        drawPolygon(FEATURE_LEFT_ORBIT)
+        drawPolygon(FEATURE_RIGHT_ORBIT)
 
         // Lips
         drawPolygon(FEATURE_LIPS_OUTER)
@@ -1405,6 +1403,12 @@ class ApplyBeautyUseCase {
 
         /** Bindi / Glabella zone (Tight diamond centered between the eyebrows). */
         private val FEATURE_BINDI_ZONE  = listOf(8, 107, 168, 336)
+
+        /** Left Orbit (Top of brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
+        private val FEATURE_LEFT_ORBIT  = listOf(107, 55, 65, 52, 53, 46, 111, 117, 118, 119, 120, 121, 128)
+
+        /** Right Orbit (Top of brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
+        private val FEATURE_RIGHT_ORBIT = listOf(336, 285, 295, 282, 283, 276, 340, 346, 347, 348, 349, 350, 357)
 
         // ── Eyes (canonical MediaPipe eye contour indices) — used only for
         // mask subtraction, to carve the eyeball/lash line back out of the
