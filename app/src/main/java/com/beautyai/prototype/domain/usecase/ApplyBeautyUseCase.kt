@@ -61,9 +61,18 @@ class ApplyBeautyUseCase {
         // Blemishes must be detected on the unsharpened image: sharpening turns pores
         // and compression texture into false positives. Unlike sharpMask, this mask has
         // segmentation and feature exclusions, so it is safe around eyes/lips/hair.
-        val blemishMask = preBlurMask(
+        // Blemishes must be detected on the unsharpened image.
+        var blemishMask = preBlurMask(
             multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 2
         )
+
+        // ISOLATED SHIELD: Protect the eyelashes and eye bags from the blemish blur
+        blemishMask = punchRegionsIntoMask(
+            blemishMask, faceData,
+            listOf(FEATURE_LEFT_ORBIT, FEATURE_RIGHT_ORBIT),
+            source.width, source.height
+        )
+
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
 
@@ -100,7 +109,7 @@ class ApplyBeautyUseCase {
                 faceData, allBagTiers, source.width, source.height, 20f
             )
 
-            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, faceData.segmentationMask, effective.underEyeReduction)
+            result = applyUnderEyeReduction(result, eyeBagsMask, eyesMask, refinedMask, effective.underEyeReduction)
         }
 
         if (effective.eyeBrightness > 0f) {
@@ -1315,9 +1324,11 @@ class ApplyBeautyUseCase {
             canvas.drawPath(path, eraserPaint)
         }
 
-        // Ocular Zone (Massive combined shield for eyes, lids, brows, and bags)
-        drawPolygon(FEATURE_LEFT_ORBIT)
-        drawPolygon(FEATURE_RIGHT_ORBIT)
+        // Ocular Zone (Tight geometry for the global pipeline)
+        drawPolygon(FEATURE_LEFT_EYE)
+        drawPolygon(FEATURE_RIGHT_EYE)
+        drawPolygon(FEATURE_LEFT_BROW)
+        drawPolygon(FEATURE_RIGHT_BROW)
 
         // Lips
         drawPolygon(FEATURE_LIPS_OUTER)
@@ -1325,9 +1336,8 @@ class ApplyBeautyUseCase {
         // Nostrils / nose base (Expanded)
         drawPolygon(FEATURE_NOSE_BASE)
 
-        // Do not exclude the glabella here. A permanent "bindi zone" hole also hides
-        // common forehead acne. If cosmetic-mark preservation is needed, detect that mark
-        // explicitly and pass it as a separate optional exclusion mask.
+        // Bindi / Forehead Center
+        drawPolygon(FEATURE_BINDI_ZONE)
 
         return bitmapToFloatArray(maskBitmap, w, h)
     }
@@ -1397,11 +1407,11 @@ class ApplyBeautyUseCase {
         /** Bindi / Glabella zone (Tight diamond centered between the eyebrows). */
         private val FEATURE_BINDI_ZONE  = listOf(8, 107, 168, 336)
 
-        /** Left Orbit (Top of brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
-        private val FEATURE_LEFT_ORBIT  = listOf(107, 55, 65, 52, 53, 46, 111, 117, 118, 119, 120, 121, 128)
+        /** Left Orbit (Inner brow -> Outer brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
+        private val FEATURE_LEFT_ORBIT  = listOf(70, 63, 105, 66, 107, 55, 65, 52, 53, 46, 111, 117, 118, 119, 120, 121, 128)
 
-        /** Right Orbit (Top of brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
-        private val FEATURE_RIGHT_ORBIT = listOf(336, 285, 295, 282, 283, 276, 340, 346, 347, 348, 349, 350, 357)
+        /** Right Orbit (Inner brow -> Outer brow -> Outer temple -> Bottom of Tier 3 eyebag -> Inner nose bridge) */
+        private val FEATURE_RIGHT_ORBIT = listOf(300, 293, 334, 296, 336, 285, 295, 282, 283, 276, 340, 346, 347, 348, 349, 350, 357)
 
         // ── Eyes (canonical MediaPipe eye contour indices) — used only for
         // mask subtraction, to carve the eyeball/lash line back out of the
