@@ -1405,8 +1405,8 @@ class ApplyBeautyUseCase {
         /** Nostrils / nose base — expanded to cover outer wings and bottom holes. */
         private val FEATURE_NOSE_BASE   = listOf(4, 45, 129, 98, 97, 2, 326, 327, 358, 275)
 
-        /** Bindi / Glabella zone (Tight diamond centered between the eyebrows). */
-        private val FEATURE_BINDI_ZONE  = listOf(8, 107, 168, 336)
+        /** Bindi / Glabella zone (Custom 8-point shield mapping the lower forehead and brow gap). */
+        private val FEATURE_BINDI_ZONE = listOf(168, 107, 66, 109, 10, 338, 296, 336)
 
         /** Left Eyelid (Inner->Outer lower brow, then Outer->Inner upper eye) */
         private val FEATURE_LEFT_EYELID = listOf(55, 65, 52, 53, 46, 33, 246, 161, 160, 159, 158, 157, 173, 133)
