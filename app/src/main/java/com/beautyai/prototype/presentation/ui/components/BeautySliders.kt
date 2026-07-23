@@ -28,11 +28,6 @@ fun BeautySliders(
             onValueChange = { onParamsChange(params.copy(skinBrightness = it)) }
         )
         BeautySliderRow(
-            label = "Skin Tone",
-            value = params.skinToneEnhancement,
-            onValueChange = { onParamsChange(params.copy(skinToneEnhancement = it)) }
-        )
-        BeautySliderRow(
             label = "Blemish Reduction",
             value = params.blemishReduction,
             onValueChange = { onParamsChange(params.copy(blemishReduction = it)) }
