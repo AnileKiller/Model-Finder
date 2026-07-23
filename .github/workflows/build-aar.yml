@@ -1,0 +1,38 @@
+name: Build Beauty Engine AAR
+
+on:
+  push:
+    branches: [ "main" ]
+  # This allows you to manually trigger the build from the GitHub Actions tab
+  workflow_dispatch: 
+
+jobs:
+  build:
+    name: Build and Extract AAR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build Release AAR
+        # Note: If your library is in a module named 'beauty-engine', 
+        # change this to: ./gradlew :beauty-engine:assembleRelease
+        run: ./gradlew assembleRelease
+
+      - name: Upload AAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beauty-engine-release-aar
+          # Adjust this path if your module is named something other than 'app'
+          path: app/build/outputs/aar/*-release.aar 
