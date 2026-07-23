@@ -9,9 +9,6 @@ package com.beautyai.prototype.domain.model
  * to be copy-pasted into other projects with zero modification.
  */
 data class BeautyParameters(
-    /** Gaussian-blur-based skin smoothing strength. */
-    val skinSmoothing: Float = 0.5f,
-
     /** Multiplicative brightness boost applied to the skin region. */
     val skinBrightness: Float = 0.3f,
 
@@ -41,7 +38,7 @@ data class BeautyParameters(
         val DEFAULT = BeautyParameters()
 
         /** Returns parameters with all sliders zeroed (no processing). */
-        val ZERO = BeautyParameters(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+        val ZERO = BeautyParameters(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
     }
 
     /**
@@ -49,7 +46,6 @@ data class BeautyParameters(
      * a global multiplier to every individual slider value.
      */
     fun withGlobalIntensity(): BeautyParameters = copy(
-        skinSmoothing         = skinSmoothing         * overallIntensity,
         skinBrightness        = skinBrightness        * overallIntensity,
         skinToneEnhancement   = skinToneEnhancement   * overallIntensity,
         blemishReduction      = blemishReduction      * overallIntensity,
