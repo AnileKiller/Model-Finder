@@ -30,6 +30,9 @@ data class BeautyParameters(
     /** Unsharp-mask sharpening applied to the whole face. */
     val faceSharpening: Float = 0.3f,
 
+    /** Darken and sharpen brow hair relative to local surroundings. */
+    val eyebrowDefinition: Float = 0.3f,
+
     /** Global multiplier that scales all of the above effects. */
     val overallIntensity: Float = 0.5f
 ) {
@@ -38,7 +41,7 @@ data class BeautyParameters(
         val DEFAULT = BeautyParameters()
 
         /** Returns parameters with all sliders zeroed (no processing). */
-        val ZERO = BeautyParameters(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+        val ZERO = BeautyParameters(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
     }
 
     /**
@@ -52,6 +55,7 @@ data class BeautyParameters(
         underEyeReduction     = underEyeReduction     * overallIntensity,
         eyeBrightness         = eyeBrightness         * overallIntensity,
         teethWhitening        = teethWhitening        * overallIntensity,
-        faceSharpening        = faceSharpening        * overallIntensity
+        faceSharpening        = faceSharpening        * overallIntensity,
+        eyebrowDefinition     = eyebrowDefinition     * overallIntensity
     )
 }
