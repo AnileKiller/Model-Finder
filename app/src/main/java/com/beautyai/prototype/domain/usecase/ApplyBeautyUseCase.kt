@@ -4,9 +4,12 @@ import android.graphics.Bitmap
 import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PointF
 import android.graphics.RectF
+import android.graphics.Shader
 import com.beautyai.prototype.domain.model.BeautyParameters
 import com.beautyai.prototype.domain.model.FaceData
 import kotlin.math.sqrt
@@ -246,10 +249,11 @@ class ApplyBeautyUseCase {
      * preserve highlights" look and runs entirely in cheap integer ops.
      */
     private fun applySkinBrightness(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
-        val liftAmount = (strength * MAX_BRIGHTNESS_LIFT).toInt().coerceIn(0, 255)
+        val liftAmount = strength * (MAX_BRIGHTNESS_LIFT / 255f)  // 0..1 range for a V-channel screen lift
         val w = src.width; val h = src.height
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
+        val hsv = FloatArray(3)
 
         for (y in 0 until h) {
             for (x in 0 until w) {
@@ -262,12 +266,14 @@ class ApplyBeautyUseCase {
                 val g = p shr 8  and 0xFF
                 val b = p        and 0xFF
 
-                // Fast Integer Screen Blending — no float math, no HSL conversion.
-                val br = 255 - ((255 - r) * (255 - liftAmount)) / 255
-                val bg = 255 - ((255 - g) * (255 - liftAmount)) / 255
-                val bb = 255 - ((255 - b) * (255 - liftAmount)) / 255
+                // Lift Value only — Hue/Saturation stay fixed, so warmth and
+                // depth survive the brighten instead of collapsing toward grey.
+                Color.RGBToHSV(r, g, b, hsv)
+                hsv[2] = (hsv[2] + liftAmount * (1f - hsv[2])).coerceIn(0f, 1f)
+                val enhancedColor = Color.HSVToColor(hsv)
 
-                val enhanced = (a shl 24) or (br shl 16) or (bg shl 8) or bb
+                val enhanced = (a shl 24) or (Color.red(enhancedColor) shl 16) or
+                               (Color.green(enhancedColor) shl 8) or Color.blue(enhancedColor)
                 pixels[idx] = blendPixel(p, enhanced, maskVal * strength)
             }
         }
@@ -893,6 +899,13 @@ class ApplyBeautyUseCase {
      * (mid-forehead), which clips out blemishes/skin near the brow-to-hairline band.
      * This pushes the top few points up by a fraction of face height to compensate.
      */
+    /**
+     * Face oval mask with the forehead arc projected upward toward the hairline,
+     * but the extension itself is a soft gradient (full strength at the true
+     * landmark boundary, fading to zero at the outer projected edge) rather than
+     * a hard fill. A flat hard extension overshoots on short foreheads, landing
+     * a fully-opaque core on hair/shadow before the uniform blur ever softens it.
+     */
     private fun createFaceOvalMask(
         faceData: FaceData, w: Int, h: Int, blurRadius: Float
     ): Array<FloatArray> {
@@ -901,37 +914,68 @@ class ApplyBeautyUseCase {
         val canvas = Canvas(maskBitmap)
         canvas.drawColor(Color.BLACK)
 
-        val fillPaint = Paint().apply {
-            color = Color.WHITE
-            isAntiAlias = true
-            style = Paint.Style.FILL
-            if (blurRadius > 0f) maskFilter = BlurMaskFilter(blurRadius, BlurMaskFilter.Blur.NORMAL)
-        }
-
-        // Face height proxy: chin (152) to brow-top (10) — stable across expressions.
-        val chin = lm[152]
-        val browTop = lm[10]
-        val faceHeightPx = kotlin.math.abs((chin.y - browTop.y) * h)
-        val extendPx = faceHeightPx * 0.55f  // tune: how far toward the hairline to reach
-
-        // Only these forehead-arc points get pushed up; jaw/cheek/temple stay put.
-        val foreheadTop = setOf(109, 10, 338, 67, 297, 251, 21, 54, 103)
-
         val ovalIndices = listOf(
             10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
             397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
             172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
         )
+        val foreheadTop = setOf(109, 10, 338, 67, 297, 251, 21, 54, 103)
 
-        val path = Path()
+        // 1. Base oval — TRUE landmark positions only, no extension. This is the
+        // guaranteed-safe region and gets the normal solid fill + blur.
+        val basePaint = Paint().apply {
+            color = Color.WHITE
+            isAntiAlias = true
+            style = Paint.Style.FILL
+            if (blurRadius > 0f) maskFilter = BlurMaskFilter(blurRadius, BlurMaskFilter.Blur.NORMAL)
+        }
+        val basePath = Path()
         ovalIndices.forEachIndexed { i, idx ->
             val p = lm[idx]
-            val x = p.x * w
-            val y = if (idx in foreheadTop) p.y * h - extendPx else p.y * h
-            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            val x = p.x * w; val y = p.y * h
+            if (i == 0) basePath.moveTo(x, y) else basePath.lineTo(x, y)
         }
-        path.close()
-        canvas.drawPath(path, fillPaint)
+        basePath.close()
+        canvas.drawPath(basePath, basePaint)
+
+        // 2. Forehead extension band — ONLY the strip between the true landmark
+        // arc and the projected hairline reach, filled with a vertical gradient
+        // that's opaque at the seam (bottom) and fully transparent at the outer
+        // edge (top). No hard fill here at all, so a short forehead's hairline
+        // shadow lands in already-faded territory instead of a solid core.
+        val chin = lm[152]
+        val browTop = lm[10]
+        val faceHeightPx = kotlin.math.abs((chin.y - browTop.y) * h)
+        val extendPx = faceHeightPx * 0.55f
+
+        val browTopY = browTop.y * h
+        val extendedTopY = browTopY - extendPx
+
+        val gradientPaint = Paint().apply {
+            isAntiAlias = true
+            style = Paint.Style.FILL
+            shader = LinearGradient(
+                0f, extendedTopY, 0f, browTopY,
+                Color.TRANSPARENT, Color.WHITE,
+                Shader.TileMode.CLAMP
+            )
+            if (blurRadius > 0f) maskFilter = BlurMaskFilter(blurRadius * 0.5f, BlurMaskFilter.Blur.NORMAL)
+        }
+
+        val bandPath = Path()
+        val foreheadOrdered = ovalIndices.filter { it in foreheadTop }
+        // true positions, left-to-right along the forehead
+        val truePts = foreheadOrdered.map { PointF(lm[it].x * w, lm[it].y * h) }
+        // projected positions, same order
+        val projPts = foreheadOrdered.map { PointF(lm[it].x * w, lm[it].y * h - extendPx) }
+
+        if (truePts.isNotEmpty()) {
+            bandPath.moveTo(truePts.first().x, truePts.first().y)
+            truePts.drop(1).forEach { bandPath.lineTo(it.x, it.y) }
+            projPts.reversed().forEach { bandPath.lineTo(it.x, it.y) }
+            bandPath.close()
+            canvas.drawPath(bandPath, gradientPaint)
+        }
 
         return bitmapToFloatArray(maskBitmap, w, h)
     }
