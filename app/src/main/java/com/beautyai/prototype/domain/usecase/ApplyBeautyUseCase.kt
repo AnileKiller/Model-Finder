@@ -37,29 +37,7 @@ class ApplyBeautyUseCase {
         // so blemishes in the brow-to-hairline band are no longer gated out.
         val faceOvalMask = createFaceOvalMask(faceData, source.width, source.height, 35f)
 
-        // 3a. Smooth mask — segmentation-based (includes neck/body-skin at the
-        // reduced 0.4x strength baked into the detector) x the face-oval
-        // geometric mask, then feathered. Used for effects that should still
-        // reach past the jawline onto visible neck skin, just less strongly.
-        // Ocular shield applied AFTER blur so it has a genuinely hard edge and
-        // can't be eroded away by the blur radius.
-        var smoothMask = preBlurMask(
-            multiplyMasks(refinedMask, faceOvalMask), source.width, source.height, 12
-        )
-        smoothMask = applyOcularSmoothingShield(smoothMask, faceData, source.width, source.height)
-
-        // Prevents bilateral filter from smearing under-eye skin
-        val eyeBagExcludedSmoothMask = punchRegionsIntoMask(
-            smoothMask, faceData,
-            listOf(
-                LEFT_EYE_BAG_TIER3, RIGHT_EYE_BAG_TIER3,
-                LEFT_EYE_BAG_TIER2, RIGHT_EYE_BAG_TIER2,
-                LEFT_EYE_BAG_INDICES, RIGHT_EYE_BAG_INDICES
-            ),
-            source.width, source.height
-        )
-
-        // 3b. Sharp mask — face oval only (no exclusion zones, just a soft geometric mask)
+        // Sharp mask — face oval only (no exclusion zones, just a soft geometric mask)
         // We do NOT punch exclusion zones because the blemish reduction logic itself 
         // uses redness/contrast detection to avoid eyes and lips naturally.
         val sharpMask = preBlurMask(faceOvalMask, source.width, source.height, 12)
@@ -92,9 +70,6 @@ class ApplyBeautyUseCase {
 
         if (effective.faceSharpening > 0f)
             result = applyFaceSharpening(result, faceData, sharpMask, effective.faceSharpening)
-
-        if (effective.skinSmoothing > 0f)
-            result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
 
         if (effective.skinBrightness > 0f)
             result = applySkinBrightness(result, brightnessMask, effective.skinBrightness)
@@ -147,107 +122,6 @@ class ApplyBeautyUseCase {
 
     // ── Individual beauty effects ────────────────────────────────────────────
 
-    private fun applySkinSmoothing(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
-        val radius = (strength * MAX_BILATERAL_RADIUS).toInt().coerceAtLeast(1)
-        val w = src.width; val h = src.height
-        val pixels = IntArray(w * h)
-        src.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        val spatialWeights = FloatArray((radius + 1) * (radius + 1))
-        for (dy in 0..radius) for (dx in 0..radius) {
-            val dist2 = (dx * dx + dy * dy).toFloat()
-            spatialWeights[dy * (radius + 1) + dx] =
-                kotlin.math.exp(-dist2 / (2f * BILATERAL_SPATIAL_SIGMA * BILATERAL_SPATIAL_SIGMA))
-        }
-
-        val bilateral = IntArray(w * h)
-
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val maskVal = mask[y][x] // Using the blurred mask
-                if (maskVal < MASK_THRESHOLD) {
-                    bilateral[y * w + x] = pixels[y * w + x]
-                    continue
-                }
-                val cp = pixels[y * w + x]
-                val cr = cp shr 16 and 0xFF
-                val cg = cp shr 8  and 0xFF
-                val cb = cp        and 0xFF
-
-                var rAcc = 0f; var gAcc = 0f; var bAcc = 0f; var wAcc = 0f
-
-                for (dy in -radius..radius) {
-                    val ny = (y + dy).coerceIn(0, h - 1)
-                    for (dx in -radius..radius) {
-                        val nx = (x + dx).coerceIn(0, w - 1)
-                        val np = pixels[ny * w + nx]
-                        val nr = np shr 16 and 0xFF
-                        val ng = np shr 8  and 0xFF
-                        val nb = np        and 0xFF
-
-                        val colorDiff = (cr - nr) * (cr - nr) +
-                                        (cg - ng) * (cg - ng) +
-                                        (cb - nb) * (cb - nb)
-                        val rangW = kotlin.math.exp(
-                            -colorDiff / (2f * BILATERAL_COLOR_SIGMA * BILATERAL_COLOR_SIGMA)
-                        )
-                        val sw = spatialWeights[
-                            kotlin.math.abs(dy) * (radius + 1) + kotlin.math.abs(dx)
-                        ]
-                        val w2 = sw * rangW
-
-                        rAcc += nr * w2
-                        gAcc += ng * w2
-                        bAcc += nb * w2
-                        wAcc += w2
-                    }
-                }
-
-                if (wAcc > 0f) {
-                    val a = cp ushr 24
-                    val smoothed = (a shl 24) or
-                            ((rAcc / wAcc).toInt().coerceIn(0, 255) shl 16) or
-                            ((gAcc / wAcc).toInt().coerceIn(0, 255) shl 8) or
-                            (bAcc / wAcc).toInt().coerceIn(0, 255)
-                    bilateral[y * w + x] = blendPixel(cp, smoothed, maskVal * strength)
-                } else {
-                    bilateral[y * w + x] = cp
-                }
-            }
-        }
-
-        val out = IntArray(w * h)
-        for (i in pixels.indices) {
-            val maskY = i / w; val maskX = i % w
-            val maskVal = mask.getOrNull(maskY)?.getOrNull(maskX) ?: 0f
-            if (maskVal < MASK_THRESHOLD) { out[i] = bilateral[i]; continue }
-
-            val orig = pixels[i]; val bil = bilateral[i]
-            val a = orig ushr 24
-            val detailR = ((orig shr 16 and 0xFF) - (bil shr 16 and 0xFF))
-            val detailG = ((orig shr 8  and 0xFF) - (bil shr 8  and 0xFF))
-            val detailB = ((orig        and 0xFF) - (bil        and 0xFF))
-
-            val textureStr = TEXTURE_PRESERVE_AMOUNT * strength 
-            val r = ((bil shr 16 and 0xFF) + detailR * textureStr).toInt().coerceIn(0, 255)
-            val g = ((bil shr 8  and 0xFF) + detailG * textureStr).toInt().coerceIn(0, 255)
-            val b = ((bil        and 0xFF) + detailB * textureStr).toInt().coerceIn(0, 255)
-            out[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
-        }
-
-        val result = src.copy(Bitmap.Config.ARGB_8888, true)
-        result.setPixels(out, 0, w, 0, 0, w, h)
-        return result
-    }
-
-    /**
-     * 3. FIX: The old implementation round-tripped every pixel through
-     * rgbToHsl()/hslToRgb() (multiple divisions + branches per pixel), which
-     * was the single biggest contributor to multi-second stalls on full-res
-     * photos. Brightness lift needs no colour-space conversion at all — a
-     * per-channel integer Screen blend produces the same "lift shadows,
-     * preserve highlights" look and runs entirely in cheap integer ops.
-     */
     private fun applySkinBrightness(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
         val liftAmount = strength * (MAX_BRIGHTNESS_LIFT / 255f)  // 0..1 range for a V-channel screen lift
         val w = src.width; val h = src.height
@@ -713,7 +587,7 @@ class ApplyBeautyUseCase {
                     val idx = y * w + x
                     val p = pixels[idx]
                     val luminance = luma(p)
-                    val eyeLikeness = smoothstep(80f, 160f, luminance)
+                    val eyeLikeness = smoothstep(15f, 45f, luminance)
                     if (eyeLikeness <= 0f) continue
 
                     val a = p ushr 24
@@ -1581,16 +1455,11 @@ class ApplyBeautyUseCase {
             340, 346, 347, 348, 349, 350, 357  // Outer to Inner (Bottom edge)
         )
 
-        // Skin smoothing
         private const val MASK_THRESHOLD            = 0.2f
         private const val BLEMISH_MAX_ALPHA         = 0.985f
         private const val BLEMISH_DIFFUSE_REDNESS_ALPHA = 0.42f
         private const val BLEMISH_LUMA_TEXTURE_KEEP = 0.74f
         private const val BLEMISH_CHROMA_TEXTURE_KEEP = 0.62f
-        private const val MAX_BILATERAL_RADIUS      = 6       
-        private const val BILATERAL_SPATIAL_SIGMA   = 3f       
-        private const val BILATERAL_COLOR_SIGMA     = 30f      
-        private const val TEXTURE_PRESERVE_AMOUNT   = 0.28f    
 
         // Brightness — max Screen-blend lift amount (0-255 integer scale)
         private const val MAX_BRIGHTNESS_LIFT       = 50f
