@@ -23,11 +23,6 @@ fun BeautySliders(
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         BeautySliderRow(
-            label = "Skin Smoothing",
-            value = params.skinSmoothing,
-            onValueChange = { onParamsChange(params.copy(skinSmoothing = it)) }
-        )
-        BeautySliderRow(
             label = "Skin Brightness",
             value = params.skinBrightness,
             onValueChange = { onParamsChange(params.copy(skinBrightness = it)) }
