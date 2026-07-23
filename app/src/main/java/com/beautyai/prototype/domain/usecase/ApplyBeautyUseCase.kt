@@ -71,6 +71,14 @@ class ApplyBeautyUseCase {
         if (effective.faceSharpening > 0f)
             result = applyFaceSharpening(result, faceData, sharpMask, effective.faceSharpening)
 
+        if (effective.eyebrowDefinition > 0f) {
+            val eyebrowMask = createFeatureMask(
+                faceData, listOf(FEATURE_LEFT_BROW, FEATURE_RIGHT_BROW),
+                source.width, source.height, blurRadius = 3f, expansion = 2f
+            )
+            result = applyEyebrowDefinition(result, faceData, eyebrowMask, effective.eyebrowDefinition)
+        }
+
         if (effective.skinBrightness > 0f)
             result = applySkinBrightness(result, brightnessMask, effective.skinBrightness)
 
@@ -706,6 +714,53 @@ class ApplyBeautyUseCase {
     }
 
     // ── Feature mask generation ──────────────────────────────────────────────
+
+    /**
+     * Eyebrow definition: darkens and sharpens brow hair relative to its own
+     * local surroundings, rather than sampling an external "hair color" — that
+     * would break for grey/dyed brows, or subjects with no visible scalp hair
+     * (hijab, bald, hat). A pixel darker than its local blur is treated as a
+     * hair strand and gets pushed darker + more separated from skin; pixels at
+     * or above local average (the skin between hairs) are left alone.
+     */
+    private fun applyEyebrowDefinition(src: Bitmap, faceData: FaceData, mask: Array<FloatArray>, strength: Float): Bitmap {
+        val w = src.width; val h = src.height
+        val pixels = IntArray(w * h)
+        src.getPixels(pixels, 0, w, 0, 0, w, h)
+        val blurred = gaussianBlur(pixels, w, h, EYEBROW_BLUR_RADIUS)
+
+        val contrastAmount = 1f + strength * MAX_BROW_CONTRAST
+        val darkenAmount = strength * MAX_BROW_DARKEN
+
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val maskVal = mask[y][x]
+                if (maskVal < MASK_THRESHOLD) continue
+                val idx = y * w + x
+                val p = pixels[idx]
+                val bp = blurred[idx]
+                val a = p ushr 24
+
+                fun channel(shift: Int): Int {
+                    val orig = p shr shift and 0xFF
+                    val base = bp shr shift and 0xFF
+                    val detail = orig - base
+                    var v = base + detail * contrastAmount
+                    if (detail < 0) {
+                        // below local average = hair core -> push darker, scaled by how dark it already is
+                        v -= (-detail / 255f) * darkenAmount * 255f
+                    }
+                    return v.toInt().coerceIn(0, 255)
+                }
+
+                val enhanced = (a shl 24) or (channel(16) shl 16) or (channel(8) shl 8) or channel(0)
+                pixels[idx] = blendPixel(p, enhanced, maskVal * strength)
+            }
+        }
+        val result = src.copy(Bitmap.Config.ARGB_8888, true)
+        result.setPixels(pixels, 0, w, 0, 0, w, h)
+        return result
+    }
 
     /**
      * 1. NEW: Builds a feathered per-pixel alpha mask (values in [0,1], sized
@@ -1476,6 +1531,11 @@ class ApplyBeautyUseCase {
         // Sharpening
         private const val SHARPEN_BLUR_RADIUS       = 2
         private const val MAX_SHARPEN_AMOUNT        = 0.65f    
-        private const val SHARPEN_MASK_THRESHOLD    = 0.6f     
+        private const val SHARPEN_MASK_THRESHOLD    = 0.6f
+
+        // Eyebrow definition
+        private const val EYEBROW_BLUR_RADIUS = 2
+        private const val MAX_BROW_CONTRAST = 0.6f
+        private const val MAX_BROW_DARKEN = 0.35f
     }
 }
