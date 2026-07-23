@@ -12,9 +12,6 @@ data class BeautyParameters(
     /** Multiplicative brightness boost applied to the skin region. */
     val skinBrightness: Float = 0.3f,
 
-    /** HSV saturation/hue shift to warm up or even out skin tone. */
-    val skinToneEnhancement: Float = 0.3f,
-
     /** Dark-spot detection and inpainting strength. */
     val blemishReduction: Float = 0.4f,
 
@@ -41,7 +38,7 @@ data class BeautyParameters(
         val DEFAULT = BeautyParameters()
 
         /** Returns parameters with all sliders zeroed (no processing). */
-        val ZERO = BeautyParameters(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+        val ZERO = BeautyParameters(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
     }
 
     /**
@@ -50,7 +47,6 @@ data class BeautyParameters(
      */
     fun withGlobalIntensity(): BeautyParameters = copy(
         skinBrightness        = skinBrightness        * overallIntensity,
-        skinToneEnhancement   = skinToneEnhancement   * overallIntensity,
         blemishReduction      = blemishReduction      * overallIntensity,
         underEyeReduction     = underEyeReduction     * overallIntensity,
         eyeBrightness         = eyeBrightness         * overallIntensity,
