@@ -1,5 +1,5 @@
 plugins {
-    alias(libs.plugins.android.application)
+    alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
@@ -9,7 +9,6 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.beautyai.prototype"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
