@@ -82,8 +82,6 @@ class ApplyBeautyUseCase {
         if (effective.skinBrightness > 0f)
             result = applySkinBrightness(result, brightnessMask, effective.skinBrightness)
 
-        if (effective.skinToneEnhancement > 0f)
-            result = applySkinTone(result, brightnessMask, effective.skinToneEnhancement)
 
         // 1. MASK FEED FIX: three distinct, non-overlapping-in-purpose masks so
         // each effect only ever samples the mask it geometrically needs —
@@ -156,33 +154,6 @@ class ApplyBeautyUseCase {
 
                 val enhanced = (a shl 24) or (Color.red(enhancedColor) shl 16) or
                                (Color.green(enhancedColor) shl 8) or Color.blue(enhancedColor)
-                pixels[idx] = blendPixel(p, enhanced, maskVal * strength)
-            }
-        }
-        val result = src.copy(Bitmap.Config.ARGB_8888, true)
-        result.setPixels(pixels, 0, w, 0, 0, w, h)
-        return result
-    }
-
-    private fun applySkinTone(src: Bitmap, mask: Array<FloatArray>, strength: Float): Bitmap {
-        // 2. MODIFIED: Cut tone offsets in half to stop the "fake tan/muddy" look
-        val rOffset = (strength * 6f).toInt()   
-        val bOffset = (strength * 5f).toInt()   
-        val w = src.width; val h = src.height
-        val pixels = IntArray(w * h)
-        src.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val maskVal = mask[y][x]
-                if (maskVal < MASK_THRESHOLD) continue
-                val idx = y * w + x
-                val p = pixels[idx]
-                val a = p ushr 24
-                val r = ((p shr 16 and 0xFF) + rOffset).coerceIn(0, 255)
-                val g = (p shr 8  and 0xFF)
-                val b = ((p and 0xFF) - bOffset).coerceIn(0, 255)
-                val enhanced = (a shl 24) or (r shl 16) or (g shl 8) or b
                 pixels[idx] = blendPixel(p, enhanced, maskVal * strength)
             }
         }
