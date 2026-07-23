@@ -899,13 +899,6 @@ class ApplyBeautyUseCase {
      * (mid-forehead), which clips out blemishes/skin near the brow-to-hairline band.
      * This pushes the top few points up by a fraction of face height to compensate.
      */
-    /**
-     * Face oval mask with the forehead arc projected upward toward the hairline,
-     * but the extension itself is a soft gradient (full strength at the true
-     * landmark boundary, fading to zero at the outer projected edge) rather than
-     * a hard fill. A flat hard extension overshoots on short foreheads, landing
-     * a fully-opaque core on hair/shadow before the uniform blur ever softens it.
-     */
     private fun createFaceOvalMask(
         faceData: FaceData, w: Int, h: Int, blurRadius: Float
     ): Array<FloatArray> {
@@ -921,37 +914,30 @@ class ApplyBeautyUseCase {
         )
         val foreheadTop = setOf(109, 10, 338, 67, 297, 251, 21, 54, 103)
 
-        // 1. Base oval — TRUE landmark positions only, no extension. This is the
-        // guaranteed-safe region and gets the normal solid fill + blur.
-        val basePaint = Paint().apply {
-            color = Color.WHITE
-            isAntiAlias = true
-            style = Paint.Style.FILL
-            if (blurRadius > 0f) maskFilter = BlurMaskFilter(blurRadius, BlurMaskFilter.Blur.NORMAL)
-        }
-        val basePath = Path()
-        ovalIndices.forEachIndexed { i, idx ->
-            val p = lm[idx]
-            val x = p.x * w; val y = p.y * h
-            if (i == 0) basePath.moveTo(x, y) else basePath.lineTo(x, y)
-        }
-        basePath.close()
-        canvas.drawPath(basePath, basePaint)
-
-        // 2. Forehead extension band — ONLY the strip between the true landmark
-        // arc and the projected hairline reach, filled with a vertical gradient
-        // that's opaque at the seam (bottom) and fully transparent at the outer
-        // edge (top). No hard fill here at all, so a short forehead's hairline
-        // shadow lands in already-faded territory instead of a solid core.
         val chin = lm[152]
         val browTop = lm[10]
         val faceHeightPx = kotlin.math.abs((chin.y - browTop.y) * h)
         val extendPx = faceHeightPx * 0.55f
-
         val browTopY = browTop.y * h
         val extendedTopY = browTopY - extendPx
 
-        val gradientPaint = Paint().apply {
+        // Single path: forehead points use their PROJECTED (extended) position,
+        // everything else uses true landmark position — one continuous outline.
+        val path = Path()
+        ovalIndices.forEachIndexed { i, idx ->
+            val p = lm[idx]
+            val x = p.x * w
+            val y = if (idx in foreheadTop) p.y * h - extendPx else p.y * h
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        path.close()
+
+        // One gradient across the whole fill: fully opaque from the true
+        // boundary downward (chin, jaw, cheeks — CLAMP holds solid white below
+        // browTopY), tapering to transparent only across the extension band
+        // above it. One blur pass afterward softens everything uniformly, so
+        // there's no seam or double-fade dip right at the old landmark line.
+        val paint = Paint().apply {
             isAntiAlias = true
             style = Paint.Style.FILL
             shader = LinearGradient(
@@ -959,23 +945,9 @@ class ApplyBeautyUseCase {
                 Color.TRANSPARENT, Color.WHITE,
                 Shader.TileMode.CLAMP
             )
-            if (blurRadius > 0f) maskFilter = BlurMaskFilter(blurRadius * 0.5f, BlurMaskFilter.Blur.NORMAL)
+            if (blurRadius > 0f) maskFilter = BlurMaskFilter(blurRadius, BlurMaskFilter.Blur.NORMAL)
         }
-
-        val bandPath = Path()
-        val foreheadOrdered = ovalIndices.filter { it in foreheadTop }
-        // true positions, left-to-right along the forehead
-        val truePts = foreheadOrdered.map { PointF(lm[it].x * w, lm[it].y * h) }
-        // projected positions, same order
-        val projPts = foreheadOrdered.map { PointF(lm[it].x * w, lm[it].y * h - extendPx) }
-
-        if (truePts.isNotEmpty()) {
-            bandPath.moveTo(truePts.first().x, truePts.first().y)
-            truePts.drop(1).forEach { bandPath.lineTo(it.x, it.y) }
-            projPts.reversed().forEach { bandPath.lineTo(it.x, it.y) }
-            bandPath.close()
-            canvas.drawPath(bandPath, gradientPaint)
-        }
+        canvas.drawPath(path, paint)
 
         return bitmapToFloatArray(maskBitmap, w, h)
     }
