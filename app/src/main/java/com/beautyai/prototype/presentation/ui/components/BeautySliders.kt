@@ -57,6 +57,11 @@ fun BeautySliders(
             value = params.faceSharpening,
             onValueChange = { onParamsChange(params.copy(faceSharpening = it)) }
         )
+        BeautySliderRow(
+            label = "Eyebrow Definition",
+            value = params.eyebrowDefinition,
+            onValueChange = { onParamsChange(params.copy(eyebrowDefinition = it)) }
+        )
 
         Spacer(Modifier.height(8.dp))
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
