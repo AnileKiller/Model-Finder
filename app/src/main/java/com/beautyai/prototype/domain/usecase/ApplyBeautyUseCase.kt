@@ -30,9 +30,9 @@ class ApplyBeautyUseCase {
         // multiplying the segmentation mask by this kills any body-skin false
         // positive that isn't near the face outline (e.g. a hand in frame),
         // since the segmentation model has no notion of "this is a hand."
-        val faceOvalMask = createFeatureMask(
-            faceData, listOf(FEATURE_FACE_OVAL), source.width, source.height, 35f
-        )
+        // createFaceOvalMask projects the forehead arc upward toward the hairline
+        // so blemishes in the brow-to-hairline band are no longer gated out.
+        val faceOvalMask = createFaceOvalMask(faceData, source.width, source.height, 35f)
 
         // 3a. Smooth mask — segmentation-based (includes neck/body-skin at the
         // reduced 0.4x strength baked into the detector) x the face-oval
@@ -70,6 +70,20 @@ class ApplyBeautyUseCase {
         )
         blemishMask = applyOcularSmoothingShield(blemishMask, faceData, source.width, source.height)
 
+        // Brightness/tone: skin-probability-aware (so hair/background inside the
+        // oval still gets excluded), but ONLY the eyes are punched out — eyebrows,
+        // lips, nose base, and the bindi/glabella mark should all receive the lift.
+        val brightnessMask = preBlurMask(
+            multiplyMasks(
+                punchExclusionZones(
+                    faceData.segmentationMask, faceData, source.width, source.height,
+                    zones = listOf(FEATURE_LEFT_EYE, FEATURE_RIGHT_EYE)
+                ),
+                faceOvalMask
+            ),
+            source.width, source.height, 12
+        )
+
         if (effective.blemishReduction > 0f)
             result = applyBlemishReduction(result, blemishMask, effective.blemishReduction, onDebugLog)
 
@@ -80,10 +94,10 @@ class ApplyBeautyUseCase {
             result = applySkinSmoothing(result, eyeBagExcludedSmoothMask, effective.skinSmoothing)
 
         if (effective.skinBrightness > 0f)
-            result = applySkinBrightness(result, smoothMask, effective.skinBrightness)
+            result = applySkinBrightness(result, brightnessMask, effective.skinBrightness)
 
         if (effective.skinToneEnhancement > 0f)
-            result = applySkinTone(result, smoothMask, effective.skinToneEnhancement)
+            result = applySkinTone(result, brightnessMask, effective.skinToneEnhancement)
 
         // 1. MASK FEED FIX: three distinct, non-overlapping-in-purpose masks so
         // each effect only ever samples the mask it geometrically needs —
@@ -873,6 +887,55 @@ class ApplyBeautyUseCase {
         return bitmapToFloatArray(maskBitmap, w, h)
     }
 
+    /**
+     * Face oval mask, with the forehead arc projected upward toward the hairline.
+     * MediaPipe FaceMesh has no hairline landmarks — its oval peaks at landmark 10
+     * (mid-forehead), which clips out blemishes/skin near the brow-to-hairline band.
+     * This pushes the top few points up by a fraction of face height to compensate.
+     */
+    private fun createFaceOvalMask(
+        faceData: FaceData, w: Int, h: Int, blurRadius: Float
+    ): Array<FloatArray> {
+        val lm = faceData.landmarks
+        val maskBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(maskBitmap)
+        canvas.drawColor(Color.BLACK)
+
+        val fillPaint = Paint().apply {
+            color = Color.WHITE
+            isAntiAlias = true
+            style = Paint.Style.FILL
+            if (blurRadius > 0f) maskFilter = BlurMaskFilter(blurRadius, BlurMaskFilter.Blur.NORMAL)
+        }
+
+        // Face height proxy: chin (152) to brow-top (10) — stable across expressions.
+        val chin = lm[152]
+        val browTop = lm[10]
+        val faceHeightPx = kotlin.math.abs((chin.y - browTop.y) * h)
+        val extendPx = faceHeightPx * 0.55f  // tune: how far toward the hairline to reach
+
+        // Only these forehead-arc points get pushed up; jaw/cheek/temple stay put.
+        val foreheadTop = setOf(109, 10, 338, 67, 297, 251, 21, 54, 103)
+
+        val ovalIndices = listOf(
+            10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+            397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+            172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+        )
+
+        val path = Path()
+        ovalIndices.forEachIndexed { i, idx ->
+            val p = lm[idx]
+            val x = p.x * w
+            val y = if (idx in foreheadTop) p.y * h - extendPx else p.y * h
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        path.close()
+        canvas.drawPath(path, fillPaint)
+
+        return bitmapToFloatArray(maskBitmap, w, h)
+    }
+
     private fun createTieredEyeBagsMask(
         faceData: FaceData,
         w: Int, h: Int,
@@ -1295,21 +1358,26 @@ class ApplyBeautyUseCase {
 
     // refinedMask stays TIGHT (no eyelid shield, no padding) — under-eye
     // reduction below needs unobstructed access to the true eye-bag zone.
+    // The `zones` parameter lets callers punch only the regions they need
+    // (e.g. eyes-only for brightnessMask) without duplicating the logic.
     private fun punchExclusionZones(
         baseMask: Array<FloatArray>,
         faceData: FaceData,
         w: Int,
-        h: Int
+        h: Int,
+        zones: List<List<Int>> = listOf(
+            FEATURE_LEFT_EYE, FEATURE_RIGHT_EYE,
+            FEATURE_LEFT_BROW, FEATURE_RIGHT_BROW,
+            FEATURE_LIPS_OUTER, FEATURE_NOSE_BASE, FEATURE_BINDI_ZONE
+        )
     ): Array<FloatArray> {
         val maskBitmap = floatArrayToBitmap(baseMask, w, h)
         val canvas = Canvas(maskBitmap)
-
         val eraserPaint = Paint().apply {
             color = Color.BLACK
             style = Paint.Style.FILL
             isAntiAlias = true
         }
-
         fun drawPolygon(indices: List<Int>) {
             if (indices.isEmpty()) return
             val path = Path()
@@ -1322,19 +1390,7 @@ class ApplyBeautyUseCase {
             path.close()
             canvas.drawPath(path, eraserPaint)
         }
-
-        // Tight exclusions only — no stroke padding, no eyelid polygons.
-        // The padded ocular shield is applied separately to smoothMask and
-        // blemishMask via applyOcularSmoothingShield(), so it never bleeds
-        // into the eye-bag zone that underEyeReduction depends on.
-        drawPolygon(FEATURE_LEFT_EYE)
-        drawPolygon(FEATURE_RIGHT_EYE)
-        drawPolygon(FEATURE_LEFT_BROW)
-        drawPolygon(FEATURE_RIGHT_BROW)
-        drawPolygon(FEATURE_LIPS_OUTER)
-        drawPolygon(FEATURE_NOSE_BASE)
-        drawPolygon(FEATURE_BINDI_ZONE)
-
+        zones.forEach { drawPolygon(it) }
         return bitmapToFloatArray(maskBitmap, w, h)
     }
 
